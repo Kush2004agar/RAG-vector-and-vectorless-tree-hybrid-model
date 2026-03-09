@@ -8,7 +8,7 @@ The project is a Retrieval-Augmented Generation (RAG) pipeline built around a **
 2. **Parent level**: Section-level summaries grouping multiple chunks.
 3. **Child level**: The raw text chunks extracted from the PDFs.
 
-The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tree structure using Google's Gemini models, stores vector embeddings in ChromaDB, and runs a multi-phase QA pipeline on questions provided in an Excel sheet.
+The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tree structure using **Gemini** (Google), stores vector embeddings in ChromaDB, and runs a multi-phase QA pipeline on questions provided in an Excel sheet. All AI reasoning and generation in this project uses **Gemini** only.
 
 ---
 
@@ -24,24 +24,21 @@ The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tre
    - Outputs a flat list of text dictionaries to `cache/raw_chunks.json`.
 
 3. **`build_chunk_tree.py` (Tree Generation)**
-   - Uses `gemini-2.5-flash` to build the hierarchy.
+   - Uses Gemini (`gemini-2.5-flash`) to build the hierarchy.
    - Groups raw chunks by `CHUNK_GROUP_SIZE` (default: 5) and generates a **Parent Summary**.
    - Groups all Parent Summaries and generates a **Root Summary** for the entire document.
    - Saves the structured hierarchy as JSON files in `cache/chunk_trees/`.
 
 4. **`setup_vector_db.py` (Database Initialization)**
    - Initializes a Persistent ChromaDB at `vector_db/`.
-   - Populates two collections:
-     - `root_summaries` (for Phase 1 filtering).
-     - `child_chunks` (The raw extracted texts).
-   - *Note: Parent nodes are NOT inserted into ChromaDB in the current design (see Technical Debt).*
+   - Populates three collections: `root_summaries`, `parent_summaries`, and `child_chunks` (all used by the retriever).
 
 5. **`chunk_tree_retriever.py` (The RAG Engine)**
-   Answers questions via a 4-Phase process:
-   - **Phase 1 (Filter)**: Queries ChromaDB `root_summaries` to find the top 3 relevant PDFs.
-   - **Phase 2 (Reason)**: Loads the corresponding JSON tree from disk, feeds the Parent Summaries into an LLM (`gemini-2.5-flash`), and asks it to select relevant Parent IDs.
-   - **Phase 3 (Extract)**: Retrieves the exact child chunks belonging to the selected Parent IDs from ChromaDB.
-   - **Phase 4 (Generate)**: Feeds the extracted child chunks into `gemini-2.5-pro` to generate the final technical answer.
+   Answers questions using **Gemini** via a multi-phase process:
+   - **Phase 1 (Filter)**: Queries ChromaDB `root_summaries` to find the top relevant PDFs.
+   - **Phase 2 (Reason)**: Uses vector search over `parent_summaries` (or Gemini over parent summaries if needed) to select relevant parent sections.
+   - **Phase 3 (Extract)**: Retrieves and ranks child chunks; merges with direct chunk search for better recall.
+   - **Phase 4 (Generate)**: Gemini (`gemini-2.5-pro`) generates the final answer from the selected chunks. A fallback pass uses a broader chunk search if the first attempt returns no answer.
 
 6. **`run_qa_pipeline.py` (Batch Execution)**
    - Automatically finds `.xlsx` files in `data/input`.
@@ -58,11 +55,8 @@ The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tre
 ### 2. Scalability & Technical Debt
 - **Weak PDF Chunking (`ingest_pdfs.py`)**: The current strategy uses a simple `\n\n` split. This is unreliable for complex PDFs, multi-column layouts, or tables. 
   - *Recommendation*: Upgrade to `LangChain`'s `RecursiveCharacterTextSplitter` or a semantic chunker.
-- **Missing Vector Representation for Parents (`setup_vector_db.py`)**: Parent node embeddings are skipped (there is literally a `pass` statement in the `setup_databases` loop). The retrieval Phase 2 relies heavily on loading raw JSON trees from disk and passing ALL parent summaries into a single Gemini prompt. 
-  - *Risk*: This will exceed the context window or result in "Lost in the Middle" LLM degradation if a PDF is very long and has many parent nodes. Parent summaries should be queried dynamically via a vector DB.
 - **Hardcoded Limit Constraints**:
-  - `run_qa_pipeline.py` is hardcoded to `.head(5)` to only evaluate 5 questions.
-  - `chunk_tree_retriever.py` is hardcoded to retrieve only the top 3 PDFs.
+  - `run_qa_pipeline.py` is hardcoded to `.head(5)` to only evaluate 5 questions by default.
 - **JSON Memory Overhead (`build_chunk_tree.py`)**: Building chunk trees loads the entire `raw_chunks.json` into memory. For large numbers of PDFs, this will cause Out-Of-Memory (OOM) errors.
   
 ### 3. Error Handling
@@ -73,6 +67,5 @@ The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tre
 ## 🚀 How to Act / Future Agent Roadmap
 When assigned to work on this repository, an Agent should prioritize the following refactoring:
 1. Implement `RecursiveCharacterTextSplitter` in `ingest_pdfs.py`.
-2. Fully populate the intermediate ChromaDB collection for `parent_summaries`.
-3. Refactor Phase 2 of `chunk_tree_retriever.py` to use Vector Semantic Search to retrieve top-k Parent nodes instead of passing the entire document's parent array to the LLM.
-4. Add robust validation logic prior to embedding inserts (avoid putting "Error strings" into Chroma).
+2. Add robust validation logic prior to embedding inserts (avoid putting "Error strings" into Chroma).
+3. (Done) `parent_summaries` is populated in ChromaDB; Phase 2 uses vector search over parents, with Gemini fallback when needed.

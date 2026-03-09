@@ -34,5 +34,11 @@ MS_FOLDER_ID = os.environ.get("MS_FOLDER_ID", "your_folder_id")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "your_gemini_api_key")
 
 # Retrieval Settings
-RETRIEVER_TOP_K = 10 # Fixed: Increased from 1 to 10 for broader context retrieval
-CHUNK_GROUP_SIZE = 5 # Number of chunks per Parent Node
+RETRIEVER_TOP_K = 10  # Legacy setting retained for compatibility
+ROOT_RETRIEVER_TOP_K = 4
+PARENT_RETRIEVER_TOP_K = 3
+DIRECT_CHUNK_RETRIEVER_TOP_K = 4
+FINAL_CONTEXT_CHUNK_COUNT = 12
+FALLBACK_CONTEXT_CHUNK_COUNT = 18
+MAX_PARENT_CANDIDATES = 8
+CHUNK_GROUP_SIZE = 5  # Number of chunks per Parent Node

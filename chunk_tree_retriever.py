@@ -1,10 +1,46 @@
 import chromadb
 import json
+import re
 from google import genai
-from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
 
-from config import VECTOR_DB_DIR, TREES_DIR, GEMINI_API_KEY, RETRIEVER_TOP_K
+from config import (
+    VECTOR_DB_DIR,
+    TREES_DIR,
+    GEMINI_API_KEY,
+    ROOT_RETRIEVER_TOP_K,
+    PARENT_RETRIEVER_TOP_K,
+    DIRECT_CHUNK_RETRIEVER_TOP_K,
+    FINAL_CONTEXT_CHUNK_COUNT,
+    FALLBACK_CONTEXT_CHUNK_COUNT,
+    MAX_PARENT_CANDIDATES,
+)
+
+NOT_FOUND_MESSAGE = "Information not found in available documents."
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+    "which",
+    "with",
+}
 
 # Setup Gemini
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -15,143 +51,335 @@ try:
     root_collection = chroma_client.get_collection(name="root_summaries")
     parents_collection = chroma_client.get_collection(name="parent_summaries")
     chunks_collection = chroma_client.get_collection(name="child_chunks")
-except Exception as e:
+except Exception:
     print("Warning: Vector DB not fully initialized. Run setup_vector_db.py first.")
     root_collection = None
     parents_collection = None
     chunks_collection = None
 
+
 def load_tree(pdf_name: str) -> Dict:
-    """Loads a specific document's tree from disk."""
+    """Load a specific document tree from disk."""
     tree_path = TREES_DIR / f"{pdf_name}.json"
     if tree_path.exists():
-        with open(tree_path, 'r') as f:
+        with open(tree_path, "r") as f:
             return json.load(f)
     return {}
 
-def answer_question(question: str) -> str:
-    """Runs the 3-Phase reasoning layer to answer a question."""
-    if not root_collection:
-        return "System error: Database not initialized."
-        
-    print(f"\n--- Processing Question: {question} ---")
-    
-    # --- PHASE 1 (The Filter) ---
-    print("Phase 1: Finding relevant Root Summaries...")
+
+def tokenize(text: str) -> List[str]:
+    return [
+        token
+        for token in re.findall(r"[a-zA-Z0-9_+-]+", text.lower())
+        if token not in STOPWORDS and len(token) > 1
+    ]
+
+
+def lexical_score(question: str, text: str) -> float:
+    question_tokens = tokenize(question)
+    text_tokens = set(tokenize(text))
+    if not question_tokens:
+        return 0.0
+
+    overlap = sum(1 for token in question_tokens if token in text_tokens)
+    coverage = overlap / len(question_tokens)
+
+    score = overlap * 2.0 + coverage * 5.0
+
+    lowered_text = text.lower()
+    if "ssh" in question.lower() and "ssh" in lowered_text:
+        score += 2.0
+    if "tls" in question.lower() and "tls" in lowered_text:
+        score += 2.0
+    if "ipsec" in question.lower() and "ipsec" in lowered_text:
+        score += 2.0
+
+    return score
+
+
+def combined_score(question: str, text: str, distance=None) -> float:
+    score = lexical_score(question, text)
+    if distance is not None:
+        score += max(0.0, 3.0 - float(distance))
+    return score
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    ordered = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def query_root_documents(question: str) -> List[str]:
     root_results = root_collection.query(
         query_texts=[question],
-        n_results=RETRIEVER_TOP_K  # Use configurable top-k
+        n_results=ROOT_RETRIEVER_TOP_K,
     )
-    
-    top_pdf_names = [meta["pdf_name"] for meta in root_results["metadatas"][0]]
-    if not top_pdf_names:
-         return "No relevant documents found."
-         
-    print(f"Top 3 PDFs selected: {top_pdf_names}")
-    
-    # --- PHASE 2 (The Reasoner) ---
-    print("Phase 2: Reasoning over Parent Summaries...")
-    selected_parent_ids = set()
+    metadatas = root_results.get("metadatas", [[]])[0]
+    return dedupe_preserve_order([meta.get("pdf_name") for meta in metadatas if meta])
+
+
+def get_parent_candidates(question: str, pdf_name: str) -> List[Dict]:
+    candidates = []
 
     if parents_collection:
-        # Vector-search parents per selected PDF instead of sending all to the LLM
-        for pdf_name in top_pdf_names:
-            try:
-                parent_results = parents_collection.query(
-                    query_texts=[question],
-                    n_results=RETRIEVER_TOP_K,
-                    where={"pdf_name": pdf_name},
-                )
-                for meta in parent_results.get("metadatas", [[]])[0]:
-                    pid = meta.get("parent_id")
-                    if pid:
-                        selected_parent_ids.add(pid)
-            except Exception as e:
-                print(f"Error querying parent_summaries for {pdf_name}: {e}")
-    else:
-        # Fallback to original LLM-based reasoning over all parents
-        for pdf_name in top_pdf_names:
-            tree = load_tree(pdf_name)
-            if not tree:
-                continue
-
-            parent_summaries = tree.get("parents", [])
-
-            parents_text = ""
-            for p in parent_summaries:
-                parents_text += f"Parent ID: {p['parent_id']}\nSummary: {p['summary']}\n\n"
-
-            prompt = (
-                f"Question: {question}\n\n"
-                f"Below are section summaries for the document '{pdf_name}'. "
-                "Based ONLY on the question and these summaries, which Parent IDs "
-                "are most likely to contain the specific technical answer? "
-                "Return ONLY a comma-separated list of Parent IDs. If none seem relevant, return 'NONE'.\n\n"
-                f"Summaries:\n{parents_text}"
+        try:
+            results = parents_collection.query(
+                query_texts=[question],
+                n_results=PARENT_RETRIEVER_TOP_K,
+                where={"pdf_name": pdf_name},
             )
+            metadatas = results.get("metadatas", [[]])[0]
+            documents = results.get("documents", [[]])[0]
+            distances = results.get("distances", [[]])[0]
 
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=genai.types.GenerateContentConfig(temperature=0.0),
-                )
-                llm_reply = response.text.strip()
-                if "NONE" not in llm_reply.upper():
-                    ids = [x.strip() for x in llm_reply.split(",") if x.strip()]
-                    for pid in ids:
-                        selected_parent_ids.add(pid)
-            except Exception as e:
-                print(f"Error reasoning over {pdf_name}: {e}")
+            for meta, document, distance in zip(metadatas, documents, distances):
+                parent_id = meta.get("parent_id")
+                if parent_id:
+                    candidates.append(
+                        {
+                            "parent_id": parent_id,
+                            "score": combined_score(question, document, distance),
+                        }
+                    )
+        except Exception as e:
+            print(f"Error querying parent_summaries for {pdf_name}: {e}")
 
-    selected_parent_ids = list(selected_parent_ids)
-    print(f"Selected Parent IDs: {selected_parent_ids}")
-    if not selected_parent_ids:
-        return "Could not identify specific sections containing the answer."
-        
-    # --- PHASE 3 (The Extractor) ---
-    print("Phase 3: Extracting specific Child Chunks...")
-    final_context_chunks = []
-    
-    # We have parent ids, now resolve them to absolute child chunk ids.
+    if candidates:
+        return candidates
+
+    tree = load_tree(pdf_name)
+    for parent in tree.get("parents", []):
+        candidates.append(
+            {
+                "parent_id": parent["parent_id"],
+                "score": lexical_score(question, parent.get("summary", "")),
+            }
+        )
+    return candidates
+
+
+def add_candidate(candidate_map: Dict[str, Dict], candidate: Dict):
+    existing = candidate_map.get(candidate["chunk_id"])
+    if not existing or candidate["score"] > existing["score"]:
+        candidate_map[candidate["chunk_id"]] = candidate
+
+
+def get_chunks_from_selected_parents(question: str, top_pdf_names: List[str], selected_parent_ids: List[str]) -> Dict[str, Dict]:
+    candidate_map = {}
+    selected_parent_id_set = set(selected_parent_ids)
+
     for pdf_name in top_pdf_names:
         tree = load_tree(pdf_name)
-        for p in tree.get("parents", []):
-            if p["parent_id"] in selected_parent_ids:
-                # We fetch exact chunks by chunk_id from Chroma or our JSON dictionary
-                child_ids = p["child_chunk_ids"]
-                child_ids = [str(cid) for cid in child_ids]
-                
-                # We pull these exact chunks from the chunks_collection
-                if child_ids:
-                     chunk_data = chunks_collection.get(ids=child_ids)
-                     for i, doc in enumerate(chunk_data["documents"]):
-                         final_context_chunks.append(f"[{pdf_name}] {doc}")
-                         
-    print(f"Extracted {len(final_context_chunks)} specific chunks. Generating final answer...")
-    
-    # --- PHASE 4: Final Answer Generation ---
-    final_context_text = "\n\n".join(final_context_chunks)
-    
-    final_prompt = (
-         f"Answer the following question using ONLY the provided context.\n"
-         f"Question: {question}\n\n"
-         f"Context:\n{final_context_text}\n\n"
-         "Provide a highly specific, technical answer directly addressing the question. "
-         "If the answer is not contained in the context, say 'Information not found in available documents.'"
-    )
-    
-    try:
-        final_response = client.models.generate_content(
-            model='gemini-2.5-pro', # Use a more powerful model for final reasoning accuracy if available, or stay on flash
-            contents=final_prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.0
+        if not tree:
+            continue
+
+        for parent in tree.get("parents", []):
+            if parent["parent_id"] not in selected_parent_id_set:
+                continue
+
+            child_ids = [str(chunk_id) for chunk_id in parent.get("child_chunk_ids", [])]
+            if not child_ids:
+                continue
+
+            try:
+                chunk_data = chunks_collection.get(ids=child_ids)
+                documents = chunk_data.get("documents", [])
+                metadatas = chunk_data.get("metadatas", []) or [{} for _ in documents]
+            except Exception:
+                documents = []
+                metadatas = []
+
+            for document, metadata in zip(documents, metadatas):
+                chunk_id = str(metadata.get("chunk_id", ""))
+                add_candidate(
+                    candidate_map,
+                    {
+                        "chunk_id": chunk_id,
+                        "pdf_name": metadata.get("pdf_name", pdf_name),
+                        "page": metadata.get("page", 0),
+                        "text": document,
+                        "score": lexical_score(question, document) + 1.5,
+                    },
+                )
+
+    return candidate_map
+
+
+def get_direct_chunk_candidates(question: str, top_pdf_names: List[str]) -> Dict[str, Dict]:
+    candidate_map = {}
+
+    if not chunks_collection:
+        return candidate_map
+
+    for pdf_name in top_pdf_names:
+        try:
+            results = chunks_collection.query(
+                query_texts=[question],
+                n_results=DIRECT_CHUNK_RETRIEVER_TOP_K,
+                where={"pdf_name": pdf_name},
             )
+            documents = results.get("documents", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            distances = results.get("distances", [[]])[0]
+
+            for metadata, document, distance in zip(metadatas, documents, distances):
+                chunk_id = str(metadata.get("chunk_id", ""))
+                add_candidate(
+                    candidate_map,
+                    {
+                        "chunk_id": chunk_id,
+                        "pdf_name": metadata.get("pdf_name", pdf_name),
+                        "page": metadata.get("page", 0),
+                        "text": document,
+                        "score": combined_score(question, document, distance),
+                    },
+                )
+        except Exception as e:
+            print(f"Error querying child_chunks for {pdf_name}: {e}")
+
+    return candidate_map
+
+
+def get_global_chunk_candidates(question: str) -> Dict[str, Dict]:
+    candidate_map = {}
+
+    if not chunks_collection:
+        return candidate_map
+
+    try:
+        results = chunks_collection.query(
+            query_texts=[question],
+            n_results=FALLBACK_CONTEXT_CHUNK_COUNT,
         )
-        return final_response.text.strip()
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        for metadata, document, distance in zip(metadatas, documents, distances):
+            chunk_id = str(metadata.get("chunk_id", ""))
+            add_candidate(
+                candidate_map,
+                {
+                    "chunk_id": chunk_id,
+                    "pdf_name": metadata.get("pdf_name", ""),
+                    "page": metadata.get("page", 0),
+                    "text": document,
+                    "score": combined_score(question, document, distance),
+                },
+            )
+    except Exception as e:
+        print(f"Error running fallback chunk search: {e}")
+
+    return candidate_map
+
+
+def rank_candidates(candidate_map: Dict[str, Dict], limit: int) -> List[Dict]:
+    ranked = sorted(
+        candidate_map.values(),
+        key=lambda item: (item["score"], len(item["text"])),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def build_context(question: str, top_pdf_names: List[str]) -> Dict:
+    all_parent_candidates = []
+    for pdf_name in top_pdf_names:
+        all_parent_candidates.extend(get_parent_candidates(question, pdf_name))
+
+    all_parent_candidates.sort(key=lambda item: item["score"], reverse=True)
+    selected_parent_ids = dedupe_preserve_order(
+        [item["parent_id"] for item in all_parent_candidates]
+    )[:MAX_PARENT_CANDIDATES]
+
+    parent_chunk_candidates = get_chunks_from_selected_parents(question, top_pdf_names, selected_parent_ids)
+    direct_chunk_candidates = get_direct_chunk_candidates(question, top_pdf_names)
+
+    merged_candidates = dict(parent_chunk_candidates)
+    for chunk_id, candidate in direct_chunk_candidates.items():
+        add_candidate(merged_candidates, candidate)
+
+    return {
+        "selected_parent_ids": selected_parent_ids,
+        "ranked_chunks": rank_candidates(merged_candidates, FINAL_CONTEXT_CHUNK_COUNT),
+    }
+
+
+def format_context(chunks: List[Dict]) -> str:
+    return "\n\n".join(
+        f"[{chunk['pdf_name']} | page {chunk['page']}]\n{chunk['text']}"
+        for chunk in chunks
+    )
+
+
+def generate_answer(question: str, context_chunks: List[Dict]) -> str:
+    if not context_chunks:
+        return NOT_FOUND_MESSAGE
+
+    final_prompt = (
+        "Answer the question using ONLY the provided document excerpts.\n"
+        f"Question: {question}\n\n"
+        "Instructions:\n"
+        "- Give the best answer supported by the excerpts, even if the wording differs from the question.\n"
+        "- Combine information from multiple excerpts when needed.\n"
+        f"- Only reply with '{NOT_FOUND_MESSAGE}' if none of the excerpts are relevant.\n\n"
+        f"Context:\n{format_context(context_chunks)}"
+    )
+
+    final_response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=final_prompt,
+        config=genai.types.GenerateContentConfig(temperature=0.0),
+    )
+    return final_response.text.strip()
+
+
+def answer_question(question: str) -> str:
+    """Run retrieval with chunk reranking and a broader retry if needed."""
+    if not root_collection:
+        return "System error: Database not initialized."
+
+    print(f"\n--- Processing Question: {question} ---")
+
+    print("Phase 1: Finding relevant root summaries...")
+    top_pdf_names = query_root_documents(question)
+    if not top_pdf_names:
+        return "No relevant documents found."
+    print(f"Top PDFs selected: {top_pdf_names}")
+
+    print("Phase 2: Finding relevant parent summaries...")
+    retrieval = build_context(question, top_pdf_names)
+    selected_parent_ids = retrieval["selected_parent_ids"]
+    ranked_chunks = retrieval["ranked_chunks"]
+    print(f"Selected parent IDs: {selected_parent_ids}")
+
+    print("Phase 3: Ranking final chunks...")
+    print(f"Using {len(ranked_chunks)} top chunks for the first answer attempt.")
+
+    try:
+        answer = generate_answer(question, ranked_chunks)
     except Exception as e:
         return f"Error generating final answer: {e}"
+
+    if answer.strip() != NOT_FOUND_MESSAGE:
+        return answer
+
+    print("Retrying with broader chunk search because the first attempt returned no answer...")
+    broader_candidates = {chunk["chunk_id"]: chunk for chunk in ranked_chunks}
+    for chunk_id, candidate in get_global_chunk_candidates(question).items():
+        add_candidate(broader_candidates, candidate)
+
+    broader_chunks = rank_candidates(broader_candidates, FALLBACK_CONTEXT_CHUNK_COUNT)
+
+    try:
+        return generate_answer(question, broader_chunks)
+    except Exception as e:
+        return f"Error generating fallback answer: {e}"
 
 if __name__ == "__main__":
     import sys

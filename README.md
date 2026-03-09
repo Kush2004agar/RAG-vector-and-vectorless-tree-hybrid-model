@@ -1,6 +1,6 @@
 # Chunk-Tree RAG Pipeline
 
-This repo contains a Python Retrieval-Augmented Generation (RAG) pipeline built around a hierarchical **chunk-tree** representation of PDFs, with ChromaDB as the vector store and Google Gemini for summarization and answering questions.
+This repo contains a Python Retrieval-Augmented Generation (RAG) pipeline built around a hierarchical **chunk-tree** representation of PDFs. All summarization and question-answering is done by **Google Gemini** (Gemini); ChromaDB is used as the vector store.
 
 The repo is set up so that a new user starts with **code only**: no cached trees, vector DB, or local data are tracked in git.
 

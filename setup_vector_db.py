@@ -34,7 +34,7 @@ def setup_databases():
         pdf_name = tree['doc_name']
 
         # Add Root summary
-        root_collection.add(
+        root_collection.upsert(
             documents=[tree['root_summary']],
             metadatas=[{"pdf_name": pdf_name}],
             ids=[f"root_{pdf_name}"]
@@ -44,6 +44,7 @@ def setup_databases():
         parent_docs = []
         parent_metas = []
         parent_ids = []
+        chunk_to_parent = {}
 
         for p in tree.get("parents", []):
             parent_docs.append(p["summary"])
@@ -54,9 +55,11 @@ def setup_databases():
                 }
             )
             parent_ids.append(f"parent_{pdf_name}_{p['parent_id']}")
+            for chunk_id in p.get("child_chunk_ids", []):
+                chunk_to_parent[str(chunk_id)] = p["parent_id"]
 
         if parent_docs:
-            parents_collection.add(
+            parents_collection.upsert(
                 documents=parent_docs,
                 metadatas=parent_metas,
                 ids=parent_ids,
@@ -75,12 +78,13 @@ def setup_databases():
                     "file_name": chunk["file_name"],
                     "page": chunk.get("page", 0),
                     "pdf_name": pdf_name,
+                    "parent_id": chunk_to_parent.get(str(chunk["chunk_id"]), ""),
                 }
             )
             chunk_ids.append(str(chunk["chunk_id"]))
 
         if chunk_docs:
-            chunks_collection.add(
+            chunks_collection.upsert(
                 documents=chunk_docs,
                 metadatas=chunk_metas,
                 ids=chunk_ids,
