@@ -26,6 +26,7 @@ from config import (
     ENABLE_RETRIEVAL_CACHE,
     RETRIEVAL_CACHE_SIZE,
 )
+from node_model import Node, legacy_tree_to_nodes
 
 NOT_FOUND_MESSAGE = "Information not found in available documents."
 STOPWORDS = {
@@ -193,6 +194,17 @@ def load_tree(pdf_name: str) -> Dict:
     return {}
 
 
+def load_node_graph(pdf_name: str) -> Dict[str, Node]:
+    """
+    Load the legacy tree JSON and adapt it to the unified Node graph.
+
+    This keeps on-disk format stable while letting retrieval code operate on
+    structured nodes instead of ad-hoc dicts.
+    """
+    tree = load_tree(pdf_name)
+    return legacy_tree_to_nodes(tree, pdf_name=pdf_name)
+
+
 def tokenize(text: str) -> List[str]:
     return [
         token
@@ -310,27 +322,30 @@ def get_chunks_from_selected_parents(question: str, top_pdf_names: List[str], se
     selected_parent_id_set = set(selected_parent_ids)
 
     for pdf_name in top_pdf_names:
-        tree = load_tree(pdf_name)
-        if not tree:
+        node_graph = load_node_graph(pdf_name)
+        if not node_graph:
             continue
 
-        for parent in tree.get("parents", []):
-            if parent["parent_id"] not in selected_parent_id_set:
+        # Parent nodes are those whose id is in selected_parent_ids
+        for parent_id in selected_parent_id_set:
+            parent_node = node_graph.get(parent_id)
+            if not parent_node:
                 continue
 
-            child_ids = [str(cid) for cid in parent.get("child_chunk_ids", [])]
-            if not child_ids:
-                continue
-
+            child_ids = [str(cid) for cid in parent_node.children]
             for cid in child_ids:
-                text, page = _chunk_text_from_tree(tree, cid)
-                if not (text and text.strip()):
+                child_node = node_graph.get(cid)
+                if not child_node:
+                    continue
+                text = child_node.content
+                page = int(child_node.metadata.get("page", 0) or 0)
+                if not (text and str(text).strip()):
                     continue
                 add_candidate(
                     candidate_map,
                     {
                         "chunk_id": cid,
-                        "pdf_name": pdf_name,
+                        "pdf_name": child_node.metadata.get("pdf_name", pdf_name),
                         "page": page,
                         "text": text,
                         "score": lexical_score(question, text) + 1.5,
@@ -499,9 +514,9 @@ def build_context(question: str, top_pdf_names: List[str], route: str = "hybrid"
     global_chunk_candidates = get_global_chunk_candidates(question)
 
     merged_candidates = dict(parent_chunk_candidates)
-    for chunk_id, candidate in direct_chunk_candidates.items():
+    for candidate in direct_chunk_candidates.values():
         add_candidate(merged_candidates, candidate)
-    for chunk_id, candidate in global_chunk_candidates.items():
+    for candidate in global_chunk_candidates.values():
         add_candidate(merged_candidates, candidate)
 
     merged_candidates = _apply_route_bias(question, route, merged_candidates)
@@ -577,9 +592,35 @@ def retrieve_relevant_chunks(question: str) -> Dict:
     return payload
 
 
+def optimize_chunks_for_context(chunks: List[Dict]) -> List[Dict]:
+    """
+    Lightweight context optimization:
+      - remove exact duplicates by (pdf_name, page, text)
+      - preserve original ranking order
+    """
+    seen_keys = set()
+    optimized: List[Dict] = []
+
+    for chunk in chunks:
+        key = (
+            str(chunk.get("pdf_name", "")),
+            int(chunk.get("page", 0) or 0),
+            str(chunk.get("text", "")).strip(),
+        )
+        if not key[2]:
+            continue
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        optimized.append(chunk)
+
+    return optimized
+
+
 def generate_answer(question: str, context_chunks: List[Dict]) -> str:
     # Use only chunks that have real text
     context_chunks = [c for c in context_chunks if c.get("text") and str(c["text"]).strip()]
+    context_chunks = optimize_chunks_for_context(context_chunks)
     if not context_chunks:
         return NOT_FOUND_MESSAGE
 
@@ -636,6 +677,7 @@ def answer_question(question: str) -> str:
     print(f"Selected parent IDs: {selected_parent_ids}")
     print(f"Candidate pool size before rerank: {len(candidate_pool)}")
 
+    print("Phase 3: Context filtering and compression...")
     print("Phase 3: Context filtering and compression...")
     usable = [c for c in ranked_chunks if c.get("text") and str(c["text"]).strip()]
     print(f"Using {len(usable)} chunks for the first answer attempt.")

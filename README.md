@@ -1,3 +1,44 @@
+## Architecture overview (hybrid hierarchical RAG)
+
+At a high level, the system is now a **hybrid hierarchical RAG** pipeline:
+
+- **Ingestion & tree building**
+  - `ingest_pdfs.py`: extracts per‑page paragraph chunks from PDFs and stores them in `cache/raw_chunks.json`.
+  - `build_chunk_tree.py`: groups chunks into **parent nodes** (sections) and generates:
+    - Parent summaries (section/group summaries).
+    - A root summary for the entire document.
+    - A **chunk tree JSON** per PDF in `cache/chunk_trees/`.
+
+- **Unified node model**
+  - `node_model.py` defines a single `Node` structure used across the system (document / section / paragraph / summary).
+  - `legacy_tree_to_nodes(...)` adapts the existing tree JSON files into a `node_id → Node` graph in memory, without changing files on disk.
+
+- **Vector DB & indices**
+  - `setup_vector_db.py` builds Chroma collections:
+    - `root_summaries` (document roots),
+    - `parent_summaries` (section/parent nodes),
+    - `child_chunks` (leaf chunks),
+  - All of which are keyed by metadata such as `pdf_name`, `page`, and (over time) `node_id`.
+
+- **Query understanding & retrieval**
+  - `query_classifier.py` implements a small, rule‑based classifier that labels each question as:
+    - definition, comparison, reasoning, summarization, navigation, or other.
+  - `chunk_tree_retriever.py` orchestrates retrieval via:
+    - `multi_stage_retrieve(question)`:
+      1. Finds relevant PDFs via root summaries.
+      2. Retrieves parent summaries and their child chunks via the node graph and Chroma.
+      3. Merges in direct and global chunk candidates.
+      4. Runs a **hybrid reranking** step (currently the legacy combined lexical+distance score, but factored out for future weighting).
+
+- **Tree expansion & context optimization**
+  - `expand_tree_neighbors(...)` in `chunk_tree_retriever.py` expands around top‑ranked chunks in the tree to pull in:
+    - their parent summary, and
+    - sibling chunks under the same parent,
+    to preserve local section coherence.
+  - `optimize_chunks_for_context(...)` deduplicates chunks by `(pdf_name, page, text)` before building the final context sent to Gemini, so the LLM sees less redundant content while keeping the best‑scored excerpts.
+
+The public entry points (`chunk_tree_retriever.answer_question` and `run_qa_pipeline.run_pipeline`) remain the same, but the internals now closely follow the **multi‑layer, node‑based hybrid RAG** roadmap.
+
 # Chunk-Tree RAG Pipeline
 
 This repo contains a Python Retrieval-Augmented Generation (RAG) pipeline built around a hierarchical **chunk-tree** representation of PDFs. All summarization and question-answering is done by **Google Gemini** (Gemini); ChromaDB is used as the vector store.
