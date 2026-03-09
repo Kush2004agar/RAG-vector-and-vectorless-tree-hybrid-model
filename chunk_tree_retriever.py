@@ -11,7 +11,7 @@ from config import (
     ROOT_RETRIEVER_TOP_K,
     PARENT_RETRIEVER_TOP_K,
     DIRECT_CHUNK_RETRIEVER_TOP_K,
-    FINAL_CONTEXT_CHUNK_COUNT,
+    INITIAL_CONTEXT_CHUNK_COUNT,
     FALLBACK_CONTEXT_CHUNK_COUNT,
     MAX_PARENT_CANDIDATES,
 )
@@ -169,6 +169,14 @@ def add_candidate(candidate_map: Dict[str, Dict], candidate: Dict):
         candidate_map[candidate["chunk_id"]] = candidate
 
 
+def _chunk_text_from_tree(tree: Dict, chunk_id: str) -> tuple:
+    """Get (text, page) for chunk_id from tree chunks. Returns ('', 0) if not found."""
+    for c in tree.get("chunks", []):
+        if str(c.get("chunk_id", "")) == str(chunk_id):
+            return (c.get("text") or "", c.get("page", 0))
+    return ("", 0)
+
+
 def get_chunks_from_selected_parents(question: str, top_pdf_names: List[str], selected_parent_ids: List[str]) -> Dict[str, Dict]:
     candidate_map = {}
     selected_parent_id_set = set(selected_parent_ids)
@@ -182,28 +190,22 @@ def get_chunks_from_selected_parents(question: str, top_pdf_names: List[str], se
             if parent["parent_id"] not in selected_parent_id_set:
                 continue
 
-            child_ids = [str(chunk_id) for chunk_id in parent.get("child_chunk_ids", [])]
+            child_ids = [str(cid) for cid in parent.get("child_chunk_ids", [])]
             if not child_ids:
                 continue
 
-            try:
-                chunk_data = chunks_collection.get(ids=child_ids)
-                documents = chunk_data.get("documents", [])
-                metadatas = chunk_data.get("metadatas", []) or [{} for _ in documents]
-            except Exception:
-                documents = []
-                metadatas = []
-
-            for document, metadata in zip(documents, metadatas):
-                chunk_id = str(metadata.get("chunk_id", ""))
+            for cid in child_ids:
+                text, page = _chunk_text_from_tree(tree, cid)
+                if not (text and text.strip()):
+                    continue
                 add_candidate(
                     candidate_map,
                     {
-                        "chunk_id": chunk_id,
-                        "pdf_name": metadata.get("pdf_name", pdf_name),
-                        "page": metadata.get("page", 0),
-                        "text": document,
-                        "score": lexical_score(question, document) + 1.5,
+                        "chunk_id": cid,
+                        "pdf_name": pdf_name,
+                        "page": page,
+                        "text": text,
+                        "score": lexical_score(question, text) + 1.5,
                     },
                 )
 
@@ -228,6 +230,8 @@ def get_direct_chunk_candidates(question: str, top_pdf_names: List[str]) -> Dict
             distances = results.get("distances", [[]])[0]
 
             for metadata, document, distance in zip(metadatas, documents, distances):
+                if document is None or not (str(document or "").strip()):
+                    continue
                 chunk_id = str(metadata.get("chunk_id", ""))
                 add_candidate(
                     candidate_map,
@@ -261,6 +265,8 @@ def get_global_chunk_candidates(question: str) -> Dict[str, Dict]:
         distances = results.get("distances", [[]])[0]
 
         for metadata, document, distance in zip(metadatas, documents, distances):
+            if document is None or not (str(document or "").strip()):
+                continue
             chunk_id = str(metadata.get("chunk_id", ""))
             add_candidate(
                 candidate_map,
@@ -299,14 +305,17 @@ def build_context(question: str, top_pdf_names: List[str]) -> Dict:
 
     parent_chunk_candidates = get_chunks_from_selected_parents(question, top_pdf_names, selected_parent_ids)
     direct_chunk_candidates = get_direct_chunk_candidates(question, top_pdf_names)
+    global_chunk_candidates = get_global_chunk_candidates(question)
 
     merged_candidates = dict(parent_chunk_candidates)
     for chunk_id, candidate in direct_chunk_candidates.items():
         add_candidate(merged_candidates, candidate)
+    for chunk_id, candidate in global_chunk_candidates.items():
+        add_candidate(merged_candidates, candidate)
 
     return {
         "selected_parent_ids": selected_parent_ids,
-        "ranked_chunks": rank_candidates(merged_candidates, FINAL_CONTEXT_CHUNK_COUNT),
+        "ranked_chunks": rank_candidates(merged_candidates, INITIAL_CONTEXT_CHUNK_COUNT),
     }
 
 
@@ -318,16 +327,20 @@ def format_context(chunks: List[Dict]) -> str:
 
 
 def generate_answer(question: str, context_chunks: List[Dict]) -> str:
+    # Use only chunks that have real text
+    context_chunks = [c for c in context_chunks if c.get("text") and str(c["text"]).strip()]
     if not context_chunks:
         return NOT_FOUND_MESSAGE
 
     final_prompt = (
-        "Answer the question using ONLY the provided document excerpts.\n"
+        "Answer the question using ONLY the provided document excerpts. Do not add any preamble or meta phrase.\n"
         f"Question: {question}\n\n"
         "Instructions:\n"
-        "- Give the best answer supported by the excerpts, even if the wording differs from the question.\n"
-        "- Combine information from multiple excerpts when needed.\n"
-        f"- Only reply with '{NOT_FOUND_MESSAGE}' if none of the excerpts are relevant.\n\n"
+        "- Give a short, direct answer. Prefer 2–4 short sentences or 3–5 concise bullet points.\n"
+        "- Focus only on the key points needed to answer the question; avoid long explanations or background theory.\n"
+        "- Start your response directly with the answer (e.g. 'The four primary security goals are:' or the first bullet). Do NOT start with phrases like 'Based on the provided document excerpts' or 'Based on the provided documents'.\n"
+        "- Base your answer on the excerpts; you may paraphrase or combine points.\n"
+        f"- Only reply with exactly '{NOT_FOUND_MESSAGE}' if the excerpts clearly contain nothing related to the question.\n\n"
         f"Context:\n{format_context(context_chunks)}"
     )
 
@@ -336,7 +349,18 @@ def generate_answer(question: str, context_chunks: List[Dict]) -> str:
         contents=final_prompt,
         config=genai.types.GenerateContentConfig(temperature=0.0),
     )
-    return final_response.text.strip()
+    answer = final_response.text.strip()
+    # Remove common preambles so the answer starts with the main content
+    for preamble in (
+        "Based on the provided document excerpts, ",
+        "Based on the provided documents, ",
+        "Based on the provided excerpts, ",
+        "Based on the document excerpts, ",
+    ):
+        if answer.startswith(preamble):
+            answer = answer[len(preamble) :].strip()
+            break
+    return answer
 
 
 def answer_question(question: str) -> str:
@@ -358,11 +382,15 @@ def answer_question(question: str) -> str:
     ranked_chunks = retrieval["ranked_chunks"]
     print(f"Selected parent IDs: {selected_parent_ids}")
 
-    print("Phase 3: Ranking final chunks...")
-    print(f"Using {len(ranked_chunks)} top chunks for the first answer attempt.")
+    print("Phase 3: Ranking final chunks (parent + direct + global)...")
+    usable = [c for c in ranked_chunks if c.get("text") and str(c["text"]).strip()]
+    print(f"Using {len(usable)} broader chunks for the first answer attempt.")
+
+    if not usable:
+        print("No usable chunks from tree/direct search; trying broader chunk search...")
 
     try:
-        answer = generate_answer(question, ranked_chunks)
+        answer = generate_answer(question, usable) if usable else NOT_FOUND_MESSAGE
     except Exception as e:
         return f"Error generating final answer: {e}"
 
@@ -385,5 +413,8 @@ if __name__ == "__main__":
     import sys
     test_q = sys.argv[1] if len(sys.argv) > 1 else "What is the difference between SSH and TLS?"
     ans = answer_question(test_q)
-    print("\nFINAL ANSWER:\n")
+    print("\n" + "=" * 60)
+    print("FINAL ANSWER:\n")
     print(ans)
+    print("=" * 60)
+    sys.stdout.flush()

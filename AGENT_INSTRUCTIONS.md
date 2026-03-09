@@ -41,8 +41,9 @@ The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tre
    - **Phase 4 (Generate)**: Gemini (`gemini-2.5-pro`) generates the final answer from the selected chunks. A fallback pass uses a broader chunk search if the first attempt returns no answer.
 
 6. **`run_qa_pipeline.py` (Batch Execution)**
-   - Automatically finds `.xlsx` files in `data/input`.
-   - Reads questions from the Excel file, runs the retriever for the first 5 questions (for rapid testing), and outputs a new Excel file with the generated answers.
+   - Reads questions from an Excel file in `data/input/` and writes `answered_<filename>.xlsx` back to `data/input/`.
+   - Supports explicit targeting via `-i/--input "Questions.xlsx"` (recommended) and will otherwise auto-pick the first `.xlsx` that is not `answered_*.xlsx`.
+   - By default, processes **all** rows unless capped by `-n/--max-questions` or `MAX_QUESTIONS`.
 
 ---
 
@@ -55,8 +56,8 @@ The pipeline pulls files from Microsoft Drive, processes PDFs into the chunk-tre
 ### 2. Scalability & Technical Debt
 - **Weak PDF Chunking (`ingest_pdfs.py`)**: The current strategy uses a simple `\n\n` split. This is unreliable for complex PDFs, multi-column layouts, or tables. 
   - *Recommendation*: Upgrade to `LangChain`'s `RecursiveCharacterTextSplitter` or a semantic chunker.
-- **Hardcoded Limit Constraints**:
-  - `run_qa_pipeline.py` is hardcoded to `.head(5)` to only evaluate 5 questions by default.
+- **Input selection pitfalls**:
+  - If `answered_*.xlsx` outputs live next to inputs, a naïve “first .xlsx file” chooser can accidentally re-read an output as the next input. The current pipeline avoids that by ignoring `answered_*.xlsx` and supporting `-i/--input`.
 - **JSON Memory Overhead (`build_chunk_tree.py`)**: Building chunk trees loads the entire `raw_chunks.json` into memory. For large numbers of PDFs, this will cause Out-Of-Memory (OOM) errors.
   
 ### 3. Error Handling
