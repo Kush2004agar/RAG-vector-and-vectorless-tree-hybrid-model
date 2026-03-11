@@ -65,12 +65,17 @@ CHUNK_OVERLAP_CHARS = int(os.environ.get("CHUNK_OVERLAP_CHARS", "120"))
 # Query router / reranker controls
 ENABLE_QUERY_ROUTER = _env_bool("ENABLE_QUERY_ROUTER", True)
 ENABLE_RERANKING = _env_bool("ENABLE_RERANKING", True)
+ENABLE_MULTI_QUERY_RETRIEVAL = _env_bool("ENABLE_MULTI_QUERY_RETRIEVAL", True)
+MULTI_QUERY_COUNT = int(os.environ.get("MULTI_QUERY_COUNT", "3"))
 RERANKER_MODEL_NAME = os.environ.get(
     "RERANKER_MODEL_NAME",
     "cross-encoder/ms-marco-MiniLM-L-6-v2",
 ).strip()
 RERANK_CANDIDATE_POOL_SIZE = int(os.environ.get("RERANK_CANDIDATE_POOL_SIZE", "30"))
 RERANKED_TOP_K = int(os.environ.get("RERANKED_TOP_K", "5"))
+TREE_SCORE_WEIGHT = float(os.environ.get("TREE_SCORE_WEIGHT", "1.0"))
+SEMANTIC_SCORE_WEIGHT = float(os.environ.get("SEMANTIC_SCORE_WEIGHT", "1.0"))
+RERANK_SCORE_WEIGHT = float(os.environ.get("RERANK_SCORE_WEIGHT", "1.5"))
 CONTEXT_COMPRESSION_MAX_CHARS = int(os.environ.get("CONTEXT_COMPRESSION_MAX_CHARS", "900"))
 CONTEXT_MIN_RELEVANCE_SCORE = float(os.environ.get("CONTEXT_MIN_RELEVANCE_SCORE", "2.0"))
 

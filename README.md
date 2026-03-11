@@ -104,16 +104,25 @@ You can tune retrieval behavior in `.env`:
 ```bash
 ENABLE_QUERY_ROUTER=true
 ENABLE_RERANKING=true
+ENABLE_MULTI_QUERY_RETRIEVAL=true
+MULTI_QUERY_COUNT=3
 RERANKER_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-6-v2
 RERANK_CANDIDATE_POOL_SIZE=30
 RERANKED_TOP_K=5
+TREE_SCORE_WEIGHT=1.0
+SEMANTIC_SCORE_WEIGHT=1.0
+RERANK_SCORE_WEIGHT=1.5
 CONTEXT_COMPRESSION_MAX_CHARS=900
 CONTEXT_MIN_RELEVANCE_SCORE=2.0
 ENABLE_RETRIEVAL_CACHE=true
 RETRIEVAL_CACHE_SIZE=256
 ```
 
-If `sentence-transformers` or the reranker model cannot load, retrieval still runs with the existing lexical/vector scoring path.
+Final retrieval scoring is explicitly:
+
+`final_score = TREE_SCORE_WEIGHT * tree_score + SEMANTIC_SCORE_WEIGHT * semantic_score + RERANK_SCORE_WEIGHT * rerank_score`
+
+If `sentence-transformers` or the reranker model cannot load, retrieval still runs with tree + semantic scoring.
 
 ## Evaluate retrieval quality
 
