@@ -2,10 +2,12 @@ import os
 import glob
 import json
 import shutil
+import re
 from pathlib import Path
 from config import (
-    INPUT_DIR, CACHE_DIR, VECTOR_DB_DIR, 
-    PROCESSED_FILES_TRACKER, KNOWLEDGE_GRAPH_FILE, CHAT_HISTORY_FILE
+    INPUT_DIR, CACHE_DIR, VECTOR_DB_DIR,
+    PROCESSED_FILES_TRACKER, KNOWLEDGE_GRAPH_FILE, CHAT_HISTORY_FILE,
+    CHUNK_MIN_CHARS, CHUNK_TARGET_CHARS, CHUNK_OVERLAP_CHARS,
 )
 from pdfplumber import open as pdf_open
 
@@ -29,6 +31,85 @@ def clear_cache():
         
     print("Cache cleared successfully.")
 
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", re.sub(r"\r\n?", "\n", text)).strip()
+
+
+def _split_into_semantic_units(text: str) -> list[str]:
+    """
+    Section/paragraph-aware splitting.
+    Prefers heading boundaries, then paragraphs.
+    """
+    cleaned = _normalize_whitespace(text)
+    if not cleaned:
+        return []
+
+    lines = [ln.strip() for ln in cleaned.split("\n")]
+    units = []
+    current = []
+
+    heading_like = re.compile(r"^([A-Z0-9][A-Z0-9 \-:/]{4,}|[0-9]+(\.[0-9]+)*\s+\S.*)$")
+    for line in lines:
+        if not line:
+            if current:
+                units.append(" ".join(current).strip())
+                current = []
+            continue
+
+        if heading_like.match(line) and current:
+            units.append(" ".join(current).strip())
+            current = [line]
+            continue
+
+        current.append(line)
+
+    if current:
+        units.append(" ".join(current).strip())
+
+    return [u for u in units if len(u) >= CHUNK_MIN_CHARS]
+
+
+def _window_units(units: list[str], target_chars: int, overlap_chars: int) -> list[str]:
+    if not units:
+        return []
+
+    chunks = []
+    i = 0
+    while i < len(units):
+        current = []
+        current_len = 0
+        j = i
+
+        while j < len(units):
+            candidate_len = current_len + (1 if current else 0) + len(units[j])
+            if current and candidate_len > target_chars:
+                break
+            current.append(units[j])
+            current_len = candidate_len
+            j += 1
+
+        if not current:
+            current = [units[i]]
+            j = i + 1
+
+        chunks.append(" ".join(current).strip())
+
+        if j >= len(units):
+            break
+
+        back_chars = 0
+        back_steps = 0
+        for k in range(len(current) - 1, -1, -1):
+            back_chars += len(current[k])
+            back_steps += 1
+            if back_chars >= overlap_chars:
+                break
+        i = max(i + 1, j - back_steps)
+
+    return chunks
+
+
 def chunk_pdf(pdf_path: Path):
     """
     Extracts text from PDF and returns a list of dictionaries.
@@ -44,11 +125,14 @@ def chunk_pdf(pdf_path: Path):
                 if not text:
                     continue
                     
-                # Simple chunking by paragraph/newline for demonstration.
-                # In production, use langchain RecursiveCharacterTextSplitter
-                paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 50]
-                
-                for p in paragraphs:
+                units = _split_into_semantic_units(text)
+                page_chunks = _window_units(
+                    units,
+                    target_chars=CHUNK_TARGET_CHARS,
+                    overlap_chars=CHUNK_OVERLAP_CHARS,
+                )
+
+                for p in page_chunks:
                     chunks.append({
                         "chunk_id": f"{pdf_path.stem}_{chunk_id}",
                         "file_name": pdf_path.name,

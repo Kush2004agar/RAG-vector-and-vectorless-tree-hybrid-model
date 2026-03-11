@@ -3,6 +3,17 @@ import json
 from pathlib import Path
 from config import VECTOR_DB_DIR, TREES_DIR
 
+
+def _valid_text(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith("error:"):
+        return False
+    return True
+
+
 def setup_databases():
     """
     Initializes ChromaDB collections for the Tree.
@@ -34,11 +45,14 @@ def setup_databases():
         pdf_name = tree['doc_name']
 
         # Add Root summary
-        root_collection.upsert(
-            documents=[tree['root_summary']],
-            metadatas=[{"pdf_name": pdf_name}],
-            ids=[f"root_{pdf_name}"]
-        )
+        if _valid_text(tree.get("root_summary", "")):
+            root_collection.upsert(
+                documents=[tree['root_summary']],
+                metadatas=[{"pdf_name": pdf_name}],
+                ids=[f"root_{pdf_name}"]
+            )
+        else:
+            print(f"Skipping invalid root summary for {pdf_name}.")
 
         # Add Parent summaries
         parent_docs = []
@@ -47,6 +61,8 @@ def setup_databases():
         chunk_to_parent = {}
 
         for p in tree.get("parents", []):
+            if not _valid_text(p.get("summary", "")):
+                continue
             parent_docs.append(p["summary"])
             parent_metas.append(
                 {
@@ -71,6 +87,8 @@ def setup_databases():
         chunk_ids = []
 
         for chunk in tree.get("chunks", []):
+            if not _valid_text(chunk.get("text", "")):
+                continue
             chunk_docs.append(chunk["text"])
             chunk_metas.append(
                 {
