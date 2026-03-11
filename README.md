@@ -4,6 +4,15 @@ This repo contains a Python Retrieval-Augmented Generation (RAG) pipeline built 
 
 The repo is set up so that a new user starts with **code only**: no cached trees, vector DB, or local data are tracked in git.
 
+## Recent improvements
+
+- Added **query routing** (tree/vector/lexical/hybrid) before retrieval.
+- Added **cross-encoder reranking** (configurable) on top candidate chunks.
+- Added **context filtering + compression** before answer generation.
+- Added **retrieval caching** for repeated questions.
+- Upgraded ingestion chunking to a more semantic, section-aware windowing strategy.
+- Added **retrieval evaluation** tooling with Precision@K / Recall@K / MRR / nDCG.
+
 ## Prerequisites
 
 - Python 3.10+
@@ -87,6 +96,36 @@ MS_FOLDER_ID=your_folder_id          # optional
   - `MAX_PARENT_CANDIDATES` (default 15) — section groups per question; raise if needed.
 - You can override via environment variables, e.g. `ROOT_RETRIEVER_TOP_K=20 INITIAL_CONTEXT_CHUNK_COUNT=80 python run_qa_pipeline.py`.
 - **Many questions**: By default all rows are processed. Set `MAX_QUESTIONS=500` in `.env` to cap. Use `-n 100` to process only the first 100. Progress is saved every `SAVE_PROGRESS_EVERY_N` questions (default 50) so a crash does not lose all work.
+
+## Reranking and routing controls
+
+You can tune retrieval behavior in `.env`:
+
+```bash
+ENABLE_QUERY_ROUTER=true
+ENABLE_RERANKING=true
+RERANKER_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-6-v2
+RERANK_CANDIDATE_POOL_SIZE=30
+RERANKED_TOP_K=5
+CONTEXT_COMPRESSION_MAX_CHARS=900
+CONTEXT_MIN_RELEVANCE_SCORE=2.0
+ENABLE_RETRIEVAL_CACHE=true
+RETRIEVAL_CACHE_SIZE=256
+```
+
+If `sentence-transformers` or the reranker model cannot load, retrieval still runs with the existing lexical/vector scoring path.
+
+## Evaluate retrieval quality
+
+Run benchmark evaluation with:
+
+```bash
+python evaluation/retrieval_evaluator.py --benchmark evaluation/benchmark_queries.json -k 5
+```
+
+The benchmark file supports either:
+- `relevant_chunk_ids` (chunk-level labels), or
+- `relevant_pdfs` (document-level labels).
 
 ## Targeting a specific questions file (without editing `.env`)
 

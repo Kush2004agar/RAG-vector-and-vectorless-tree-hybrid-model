@@ -1,7 +1,9 @@
 import chromadb
 import json
 import re
+from collections import OrderedDict
 from google import genai
+from threading import Lock
 from typing import Dict, List
 
 from config import (
@@ -14,6 +16,15 @@ from config import (
     INITIAL_CONTEXT_CHUNK_COUNT,
     FALLBACK_CONTEXT_CHUNK_COUNT,
     MAX_PARENT_CANDIDATES,
+    ENABLE_QUERY_ROUTER,
+    ENABLE_RERANKING,
+    RERANKER_MODEL_NAME,
+    RERANK_CANDIDATE_POOL_SIZE,
+    RERANKED_TOP_K,
+    CONTEXT_COMPRESSION_MAX_CHARS,
+    CONTEXT_MIN_RELEVANCE_SCORE,
+    ENABLE_RETRIEVAL_CACHE,
+    RETRIEVAL_CACHE_SIZE,
 )
 
 NOT_FOUND_MESSAGE = "Information not found in available documents."
@@ -56,6 +67,121 @@ except Exception:
     root_collection = None
     parents_collection = None
     chunks_collection = None
+
+RETRIEVAL_CACHE: OrderedDict[str, Dict] = OrderedDict()
+RETRIEVAL_CACHE_LOCK = Lock()
+
+
+def _clone_jsonable(value):
+    return json.loads(json.dumps(value))
+
+
+def _cache_key(question: str) -> str:
+    return " ".join((question or "").strip().lower().split())
+
+
+def _cache_get(question: str) -> Dict | None:
+    if not ENABLE_RETRIEVAL_CACHE:
+        return None
+    key = _cache_key(question)
+    with RETRIEVAL_CACHE_LOCK:
+        if key not in RETRIEVAL_CACHE:
+            return None
+        RETRIEVAL_CACHE.move_to_end(key)
+        return _clone_jsonable(RETRIEVAL_CACHE[key])
+
+
+def _cache_set(question: str, payload: Dict):
+    if not ENABLE_RETRIEVAL_CACHE:
+        return
+    key = _cache_key(question)
+    with RETRIEVAL_CACHE_LOCK:
+        RETRIEVAL_CACHE[key] = _clone_jsonable(payload)
+        RETRIEVAL_CACHE.move_to_end(key)
+        while len(RETRIEVAL_CACHE) > RETRIEVAL_CACHE_SIZE:
+            RETRIEVAL_CACHE.popitem(last=False)
+
+
+def _route_query(question: str) -> str:
+    """
+    Lightweight router for retrieval strategy selection.
+    Returns one of: 'tree', 'vector', 'lexical', 'hybrid'.
+    """
+    if not ENABLE_QUERY_ROUTER:
+        return "hybrid"
+
+    q = (question or "").lower()
+    tokens = tokenize(question)
+
+    lexical_markers = ("exact", "verbatim", "quote", "page", "section", "clause", "table")
+    tree_markers = ("overview", "high-level", "summary", "summarize", "architecture")
+    if any(marker in q for marker in lexical_markers):
+        return "lexical"
+    if any(marker in q for marker in tree_markers):
+        return "tree"
+    if len(tokens) <= 4:
+        return "tree"
+    if len(tokens) >= 12:
+        return "vector"
+    return "hybrid"
+
+
+def _compress_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    left = max_chars // 2
+    right = max_chars - left - 5
+    return f"{text[:left].rstrip()} ... {text[-right:].lstrip()}"
+
+
+class CrossEncoderReranker:
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.model = None
+        self.load_error = ""
+        self._load_attempted = False
+
+    def _ensure_loaded(self):
+        if self._load_attempted:
+            return
+        self._load_attempted = True
+        if not ENABLE_RERANKING:
+            self.load_error = "Reranking disabled by config."
+            return
+
+        try:
+            from sentence_transformers import CrossEncoder
+
+            self.model = CrossEncoder(self.model_name)
+        except Exception as e:
+            self.load_error = str(e)
+
+    def score(self, question: str, candidates: List[Dict]) -> List[Dict]:
+        if not candidates:
+            return []
+        self._ensure_loaded()
+        if self.model is None:
+            return candidates
+
+        pairs = [(question, c.get("text", "")[:2000]) for c in candidates]
+        try:
+            scores = self.model.predict(pairs)
+        except Exception as e:
+            self.load_error = str(e)
+            return candidates
+
+        rescored = []
+        for c, score in zip(candidates, scores):
+            item = dict(c)
+            item["rerank_score"] = float(score)
+            # Keep lexical/vector score and add reranker influence.
+            item["score"] = item.get("score", 0.0) + (float(score) * 2.0)
+            rescored.append(item)
+        return rescored
+
+
+reranker = CrossEncoderReranker(RERANKER_MODEL_NAME)
 
 
 def load_tree(pdf_name: str) -> Dict:
@@ -164,9 +290,11 @@ def get_parent_candidates(question: str, pdf_name: str) -> List[Dict]:
 
 
 def add_candidate(candidate_map: Dict[str, Dict], candidate: Dict):
-    existing = candidate_map.get(candidate["chunk_id"])
+    key = f"{candidate.get('pdf_name', '')}::{candidate.get('chunk_id', '')}"
+    candidate["candidate_key"] = key
+    existing = candidate_map.get(key)
     if not existing or candidate["score"] > existing["score"]:
-        candidate_map[candidate["chunk_id"]] = candidate
+        candidate_map[key] = candidate
 
 
 def _chunk_text_from_tree(tree: Dict, chunk_id: str) -> tuple:
@@ -206,6 +334,7 @@ def get_chunks_from_selected_parents(question: str, top_pdf_names: List[str], se
                         "page": page,
                         "text": text,
                         "score": lexical_score(question, text) + 1.5,
+                        "source": "tree",
                     },
                 )
 
@@ -241,6 +370,7 @@ def get_direct_chunk_candidates(question: str, top_pdf_names: List[str]) -> Dict
                         "page": metadata.get("page", 0),
                         "text": document,
                         "score": combined_score(question, document, distance),
+                        "source": "vector",
                     },
                 )
         except Exception as e:
@@ -276,6 +406,7 @@ def get_global_chunk_candidates(question: str) -> Dict[str, Dict]:
                     "page": metadata.get("page", 0),
                     "text": document,
                     "score": combined_score(question, document, distance),
+                    "source": "vector_global",
                 },
             )
     except Exception as e:
@@ -284,16 +415,76 @@ def get_global_chunk_candidates(question: str) -> Dict[str, Dict]:
     return candidate_map
 
 
-def rank_candidates(candidate_map: Dict[str, Dict], limit: int) -> List[Dict]:
+def rank_candidates(candidate_map_or_list, limit: int) -> List[Dict]:
+    if isinstance(candidate_map_or_list, dict):
+        values = candidate_map_or_list.values()
+    else:
+        values = candidate_map_or_list
+
     ranked = sorted(
-        candidate_map.values(),
-        key=lambda item: (item["score"], len(item["text"])),
+        values,
+        key=lambda item: (
+            item.get("rerank_score", 0.0),
+            item.get("score", 0.0),
+            len(item.get("text", "")),
+        ),
         reverse=True,
     )
     return ranked[:limit]
 
 
-def build_context(question: str, top_pdf_names: List[str]) -> Dict:
+def _apply_route_bias(question: str, route: str, candidates: Dict[str, Dict]) -> Dict[str, Dict]:
+    if route == "hybrid":
+        return candidates
+
+    for c in candidates.values():
+        source = c.get("source", "")
+        if route == "tree":
+            if source == "tree":
+                c["score"] += 1.5
+        elif route == "vector":
+            if source in {"vector", "vector_global"}:
+                c["score"] += 1.2
+        elif route == "lexical":
+            c["score"] += lexical_score(question, c.get("text", "")) * 0.2
+            if source == "tree":
+                c["score"] -= 0.25
+    return candidates
+
+
+def _rerank_candidates(question: str, candidates: List[Dict], top_k: int) -> List[Dict]:
+    if not candidates:
+        return []
+    rescored = reranker.score(question, candidates)
+    return rank_candidates(rescored, top_k)
+
+
+def _filter_and_compress_context(question: str, chunks: List[Dict], limit: int) -> List[Dict]:
+    filtered = []
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        if not text or not str(text).strip():
+            continue
+        relevance = lexical_score(question, text)
+        if relevance >= CONTEXT_MIN_RELEVANCE_SCORE or chunk.get("rerank_score") is not None:
+            item = dict(chunk)
+            item["text"] = _compress_text(text, CONTEXT_COMPRESSION_MAX_CHARS)
+            item["relevance_score"] = relevance
+            filtered.append(item)
+
+    if not filtered:
+        # If threshold was too strict, keep top chunks anyway.
+        fallback = rank_candidates(chunks, limit)
+        for chunk in fallback:
+            item = dict(chunk)
+            item["text"] = _compress_text(item.get("text", ""), CONTEXT_COMPRESSION_MAX_CHARS)
+            item["relevance_score"] = lexical_score(question, item.get("text", ""))
+            filtered.append(item)
+
+    return filtered[:limit]
+
+
+def build_context(question: str, top_pdf_names: List[str], route: str = "hybrid") -> Dict:
     all_parent_candidates = []
     for pdf_name in top_pdf_names:
         all_parent_candidates.extend(get_parent_candidates(question, pdf_name))
@@ -313,9 +504,27 @@ def build_context(question: str, top_pdf_names: List[str]) -> Dict:
     for chunk_id, candidate in global_chunk_candidates.items():
         add_candidate(merged_candidates, candidate)
 
+    merged_candidates = _apply_route_bias(question, route, merged_candidates)
+    candidate_pool_size = (
+        RERANK_CANDIDATE_POOL_SIZE if ENABLE_RERANKING else INITIAL_CONTEXT_CHUNK_COUNT
+    )
+    candidate_pool = rank_candidates(merged_candidates, candidate_pool_size)
+    reranked_chunks = _rerank_candidates(
+        question,
+        candidate_pool,
+        RERANKED_TOP_K if ENABLE_RERANKING else INITIAL_CONTEXT_CHUNK_COUNT,
+    )
+    final_chunks = _filter_and_compress_context(
+        question,
+        reranked_chunks,
+        RERANKED_TOP_K if ENABLE_RERANKING else INITIAL_CONTEXT_CHUNK_COUNT,
+    )
+
     return {
+        "route": route,
         "selected_parent_ids": selected_parent_ids,
-        "ranked_chunks": rank_candidates(merged_candidates, INITIAL_CONTEXT_CHUNK_COUNT),
+        "candidate_pool": candidate_pool,
+        "ranked_chunks": final_chunks,
     }
 
 
@@ -324,6 +533,48 @@ def format_context(chunks: List[Dict]) -> str:
         f"[{chunk['pdf_name']} | page {chunk['page']}]\n{chunk['text']}"
         for chunk in chunks
     )
+
+
+def retrieve_relevant_chunks(question: str) -> Dict:
+    if not root_collection:
+        return {
+            "route": "hybrid",
+            "top_pdf_names": [],
+            "selected_parent_ids": [],
+            "candidate_pool": [],
+            "ranked_chunks": [],
+        }
+
+    cached = _cache_get(question)
+    if cached is not None:
+        cached["cache_hit"] = True
+        return cached
+
+    route = _route_query(question)
+    top_pdf_names = query_root_documents(question)
+    if not top_pdf_names:
+        payload = {
+            "route": route,
+            "top_pdf_names": [],
+            "selected_parent_ids": [],
+            "candidate_pool": [],
+            "ranked_chunks": [],
+            "cache_hit": False,
+        }
+        _cache_set(question, payload)
+        return payload
+
+    context = build_context(question, top_pdf_names, route=route)
+    payload = {
+        "route": route,
+        "top_pdf_names": top_pdf_names,
+        "selected_parent_ids": context["selected_parent_ids"],
+        "candidate_pool": context["candidate_pool"],
+        "ranked_chunks": context["ranked_chunks"],
+        "cache_hit": False,
+    }
+    _cache_set(question, payload)
+    return payload
 
 
 def generate_answer(question: str, context_chunks: List[Dict]) -> str:
@@ -364,30 +615,33 @@ def generate_answer(question: str, context_chunks: List[Dict]) -> str:
 
 
 def answer_question(question: str) -> str:
-    """Run retrieval with chunk reranking and a broader retry if needed."""
+    """Run routed retrieval + reranking and fallback if needed."""
     if not root_collection:
         return "System error: Database not initialized."
 
     print(f"\n--- Processing Question: {question} ---")
 
-    print("Phase 1: Finding relevant root summaries...")
-    top_pdf_names = query_root_documents(question)
+    print("Phase 1: Query routing + root retrieval...")
+    retrieval = retrieve_relevant_chunks(question)
+    top_pdf_names = retrieval["top_pdf_names"]
     if not top_pdf_names:
         return "No relevant documents found."
+    print(f"Route selected: {retrieval['route']} (cache_hit={retrieval.get('cache_hit', False)})")
     print(f"Top PDFs selected: {top_pdf_names}")
 
-    print("Phase 2: Finding relevant parent summaries...")
-    retrieval = build_context(question, top_pdf_names)
+    print("Phase 2: Parent + direct retrieval and reranking...")
     selected_parent_ids = retrieval["selected_parent_ids"]
+    candidate_pool = retrieval["candidate_pool"]
     ranked_chunks = retrieval["ranked_chunks"]
     print(f"Selected parent IDs: {selected_parent_ids}")
+    print(f"Candidate pool size before rerank: {len(candidate_pool)}")
 
-    print("Phase 3: Ranking final chunks (parent + direct + global)...")
+    print("Phase 3: Context filtering and compression...")
     usable = [c for c in ranked_chunks if c.get("text") and str(c["text"]).strip()]
-    print(f"Using {len(usable)} broader chunks for the first answer attempt.")
+    print(f"Using {len(usable)} chunks for the first answer attempt.")
 
     if not usable:
-        print("No usable chunks from tree/direct search; trying broader chunk search...")
+        print("No usable chunks from routed search; trying broader chunk search...")
 
     try:
         answer = generate_answer(question, usable) if usable else NOT_FOUND_MESSAGE
@@ -398,11 +652,20 @@ def answer_question(question: str) -> str:
         return answer
 
     print("Retrying with broader chunk search because the first attempt returned no answer...")
-    broader_candidates = {chunk["chunk_id"]: chunk for chunk in ranked_chunks}
+    broader_candidates = {
+        chunk.get("candidate_key", f"{chunk.get('pdf_name', '')}::{chunk.get('chunk_id', '')}"): dict(chunk)
+        for chunk in candidate_pool
+    }
     for chunk_id, candidate in get_global_chunk_candidates(question).items():
         add_candidate(broader_candidates, candidate)
 
-    broader_chunks = rank_candidates(broader_candidates, FALLBACK_CONTEXT_CHUNK_COUNT)
+    broader_ranked = rank_candidates(broader_candidates, FALLBACK_CONTEXT_CHUNK_COUNT)
+    broader_reranked = _rerank_candidates(
+        question,
+        broader_ranked,
+        min(FALLBACK_CONTEXT_CHUNK_COUNT, max(RERANKED_TOP_K, INITIAL_CONTEXT_CHUNK_COUNT)),
+    )
+    broader_chunks = _filter_and_compress_context(question, broader_reranked, FALLBACK_CONTEXT_CHUNK_COUNT)
 
     try:
         return generate_answer(question, broader_chunks)

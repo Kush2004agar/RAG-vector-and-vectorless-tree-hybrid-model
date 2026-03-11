@@ -35,6 +35,14 @@ MS_FOLDER_ID = os.environ.get("MS_FOLDER_ID", "your_folder_id")
 _raw_key = os.environ.get("GEMINI_API_KEY", "your_gemini_api_key")
 GEMINI_API_KEY = _raw_key.strip().strip('"').strip("'") if _raw_key else ""
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Retrieval Settings
 # For 1000+ PDFs: increase ROOT_RETRIEVER_TOP_K (e.g. 15–20), INITIAL_CONTEXT_CHUNK_COUNT (e.g. 50–80),
 # FALLBACK_CONTEXT_CHUNK_COUNT (e.g. 80–100), MAX_PARENT_CANDIDATES (e.g. 15–20).
@@ -48,6 +56,27 @@ FALLBACK_CONTEXT_CHUNK_COUNT = int(os.environ.get("FALLBACK_CONTEXT_CHUNK_COUNT"
 FINAL_CONTEXT_CHUNK_COUNT = INITIAL_CONTEXT_CHUNK_COUNT
 MAX_PARENT_CANDIDATES = int(os.environ.get("MAX_PARENT_CANDIDATES", "15"))
 CHUNK_GROUP_SIZE = int(os.environ.get("CHUNK_GROUP_SIZE", "5"))  # Number of chunks per Parent Node
+
+# Ingestion/chunking controls
+CHUNK_MIN_CHARS = int(os.environ.get("CHUNK_MIN_CHARS", "160"))
+CHUNK_TARGET_CHARS = int(os.environ.get("CHUNK_TARGET_CHARS", "900"))
+CHUNK_OVERLAP_CHARS = int(os.environ.get("CHUNK_OVERLAP_CHARS", "120"))
+
+# Query router / reranker controls
+ENABLE_QUERY_ROUTER = _env_bool("ENABLE_QUERY_ROUTER", True)
+ENABLE_RERANKING = _env_bool("ENABLE_RERANKING", True)
+RERANKER_MODEL_NAME = os.environ.get(
+    "RERANKER_MODEL_NAME",
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+).strip()
+RERANK_CANDIDATE_POOL_SIZE = int(os.environ.get("RERANK_CANDIDATE_POOL_SIZE", "30"))
+RERANKED_TOP_K = int(os.environ.get("RERANKED_TOP_K", "5"))
+CONTEXT_COMPRESSION_MAX_CHARS = int(os.environ.get("CONTEXT_COMPRESSION_MAX_CHARS", "900"))
+CONTEXT_MIN_RELEVANCE_SCORE = float(os.environ.get("CONTEXT_MIN_RELEVANCE_SCORE", "2.0"))
+
+# Retrieval result cache
+ENABLE_RETRIEVAL_CACHE = _env_bool("ENABLE_RETRIEVAL_CACHE", True)
+RETRIEVAL_CACHE_SIZE = int(os.environ.get("RETRIEVAL_CACHE_SIZE", "256"))
 
 # Excel QA pipeline: max questions to process (None = all rows in the Excel)
 _max_q = (os.environ.get("MAX_QUESTIONS") or "all").strip().lower()

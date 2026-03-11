@@ -6,3 +6,4 @@ openpyxl
 msal
 requests
 python-dotenv
+sentence-transformers
