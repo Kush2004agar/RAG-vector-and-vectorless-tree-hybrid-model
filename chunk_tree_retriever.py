@@ -20,7 +20,13 @@ from config import (
     ENABLE_QUERY_ROUTER,
     ENABLE_RERANKING,
     ENABLE_MULTI_QUERY_RETRIEVAL,
+    ENABLE_HYBRID_RETRIEVAL,
     MULTI_QUERY_COUNT,
+    PARENTS_PER_DOCUMENT,
+    BM25_TOP_K,
+    VECTOR_QUERY_CACHE_SIZE,
+    TREE_CACHE_SIZE,
+    TOKEN_CACHE_SIZE,
     RERANKER_MODEL_NAME,
     RERANK_CANDIDATE_POOL_SIZE,
     RERANKED_TOP_K,
@@ -76,6 +82,12 @@ except Exception:
 
 RETRIEVAL_CACHE: OrderedDict[str, Dict] = OrderedDict()
 RETRIEVAL_CACHE_LOCK = Lock()
+VECTOR_QUERY_CACHE: OrderedDict[str, Dict] = OrderedDict()
+VECTOR_QUERY_CACHE_LOCK = Lock()
+TREE_CACHE: OrderedDict[str, Dict] = OrderedDict()
+TREE_CACHE_LOCK = Lock()
+TOKEN_CACHE: OrderedDict[str, List[str]] = OrderedDict()
+TOKEN_CACHE_LOCK = Lock()
 
 
 def _clone_jsonable(value):
@@ -106,6 +118,33 @@ def _cache_set(question: str, payload: Dict):
         RETRIEVAL_CACHE.move_to_end(key)
         while len(RETRIEVAL_CACHE) > RETRIEVAL_CACHE_SIZE:
             RETRIEVAL_CACHE.popitem(last=False)
+
+
+def _json_key(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _cached_collection_query(collection, collection_name: str, query: str, n_results: int, where: Dict | None = None) -> Dict:
+    if collection is None:
+        return {}
+
+    cache_key = f"{collection_name}|{query}|{n_results}|{_json_key(where or {})}"
+    with VECTOR_QUERY_CACHE_LOCK:
+        if cache_key in VECTOR_QUERY_CACHE:
+            VECTOR_QUERY_CACHE.move_to_end(cache_key)
+            return _clone_jsonable(VECTOR_QUERY_CACHE[cache_key])
+
+    kwargs = {"query_texts": [query], "n_results": n_results}
+    if where:
+        kwargs["where"] = where
+    results = collection.query(**kwargs)
+
+    with VECTOR_QUERY_CACHE_LOCK:
+        VECTOR_QUERY_CACHE[cache_key] = _clone_jsonable(results)
+        VECTOR_QUERY_CACHE.move_to_end(cache_key)
+        while len(VECTOR_QUERY_CACHE) > VECTOR_QUERY_CACHE_SIZE:
+            VECTOR_QUERY_CACHE.popitem(last=False)
+    return results
 
 
 def _route_query(question: str) -> str:
@@ -192,19 +231,45 @@ reranker = CrossEncoderReranker(RERANKER_MODEL_NAME)
 
 def load_tree(pdf_name: str) -> Dict:
     """Load a specific document tree from disk."""
+    with TREE_CACHE_LOCK:
+        if pdf_name in TREE_CACHE:
+            TREE_CACHE.move_to_end(pdf_name)
+            return TREE_CACHE[pdf_name]
+
     tree_path = TREES_DIR / f"{pdf_name}.json"
     if tree_path.exists():
         with open(tree_path, "r") as f:
-            return json.load(f)
+            tree = json.load(f)
+        with TREE_CACHE_LOCK:
+            TREE_CACHE[pdf_name] = tree
+            TREE_CACHE.move_to_end(pdf_name)
+            while len(TREE_CACHE) > TREE_CACHE_SIZE:
+                TREE_CACHE.popitem(last=False)
+        return tree
     return {}
 
 
 def tokenize(text: str) -> List[str]:
-    return [
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return []
+
+    with TOKEN_CACHE_LOCK:
+        if normalized in TOKEN_CACHE:
+            TOKEN_CACHE.move_to_end(normalized)
+            return TOKEN_CACHE[normalized]
+
+    tokens = [
         token
-        for token in re.findall(r"[a-zA-Z0-9_+-]+", text.lower())
+        for token in re.findall(r"[a-zA-Z0-9_+-]+", normalized)
         if token not in STOPWORDS and len(token) > 1
     ]
+    with TOKEN_CACHE_LOCK:
+        TOKEN_CACHE[normalized] = tokens
+        TOKEN_CACHE.move_to_end(normalized)
+        while len(TOKEN_CACHE) > TOKEN_CACHE_SIZE:
+            TOKEN_CACHE.popitem(last=False)
+    return tokens
 
 
 def lexical_score(question: str, text: str) -> float:
@@ -305,12 +370,79 @@ def dedupe_preserve_order(items: List[str]) -> List[str]:
     return ordered
 
 
+def _bm25_scores(query_tokens: List[str], docs_tokens: List[List[str]]) -> List[float]:
+    if not query_tokens or not docs_tokens:
+        return [0.0] * len(docs_tokens)
+
+    n_docs = len(docs_tokens)
+    avgdl = (sum(len(toks) for toks in docs_tokens) / n_docs) if n_docs else 0.0
+    if avgdl <= 0:
+        return [0.0] * n_docs
+
+    # Document frequencies
+    doc_freq: Dict[str, int] = {}
+    for tokens in docs_tokens:
+        for term in set(tokens):
+            doc_freq[term] = doc_freq.get(term, 0) + 1
+
+    idf: Dict[str, float] = {}
+    for term, df in doc_freq.items():
+        idf[term] = math.log(((n_docs - df + 0.5) / (df + 0.5)) + 1.0)
+
+    k1 = 1.5
+    b = 0.75
+    scores = []
+    for tokens in docs_tokens:
+        tf: Dict[str, int] = {}
+        for token in tokens:
+            tf[token] = tf.get(token, 0) + 1
+
+        dl = len(tokens)
+        score = 0.0
+        for term in query_tokens:
+            if term not in tf:
+                continue
+            numer = tf[term] * (k1 + 1.0)
+            denom = tf[term] + k1 * (1.0 - b + b * (dl / avgdl))
+            score += idf.get(term, 0.0) * (numer / denom)
+        scores.append(score)
+    return scores
+
+
+def apply_bm25_scores(query: str, candidate_map: Dict[str, Dict], query_weight: float = 1.0):
+    if not ENABLE_HYBRID_RETRIEVAL or not candidate_map:
+        return
+
+    keys = list(candidate_map.keys())
+    docs_tokens = [tokenize(candidate_map[k].get("text", "")) for k in keys]
+    q_tokens = tokenize(query)
+    raw_scores = _bm25_scores(q_tokens, docs_tokens)
+    if not raw_scores:
+        return
+
+    ranked_idx = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)[:BM25_TOP_K]
+    max_score = raw_scores[ranked_idx[0]] if ranked_idx and raw_scores[ranked_idx[0]] > 0 else 0.0
+
+    for i in ranked_idx:
+        if raw_scores[i] <= 0:
+            continue
+        key = keys[i]
+        candidate = candidate_map[key]
+        bm25_norm = (raw_scores[i] / max_score) * 5.0 if max_score > 0 else 0.0
+        # BM25 contributes to the lexical/tree component of final scoring.
+        candidate["bm25_score"] = max(float(candidate.get("bm25_score", 0.0)), bm25_norm * query_weight)
+        candidate["tree_score"] = float(candidate.get("tree_score", 0.0)) + (bm25_norm * query_weight)
+        candidate["score"] = compute_total_score(candidate)
+
+
 def query_root_documents(question: str) -> List[str]:
     if not root_collection:
         return []
-    root_results = root_collection.query(
-        query_texts=[question],
-        n_results=ROOT_RETRIEVER_TOP_K,
+    root_results = _cached_collection_query(
+        root_collection,
+        "root_summaries",
+        question,
+        ROOT_RETRIEVER_TOP_K,
     )
     metadatas = root_results.get("metadatas", [[]])[0]
     return dedupe_preserve_order([meta.get("pdf_name") for meta in metadatas if meta])
@@ -336,9 +468,11 @@ def get_parent_candidates(question: str, pdf_name: str) -> List[Dict]:
 
     if parents_collection:
         try:
-            results = parents_collection.query(
-                query_texts=[question],
-                n_results=PARENT_RETRIEVER_TOP_K,
+            results = _cached_collection_query(
+                parents_collection,
+                "parent_summaries",
+                question,
+                PARENT_RETRIEVER_TOP_K,
                 where={"pdf_name": pdf_name},
             )
             metadatas = results.get("metadatas", [[]])[0]
@@ -352,6 +486,7 @@ def get_parent_candidates(question: str, pdf_name: str) -> List[Dict]:
                     candidates.append(
                         {
                             "parent_id": parent_id,
+                            "pdf_name": pdf_name,
                             "score": comp["score"],
                         }
                     )
@@ -367,6 +502,7 @@ def get_parent_candidates(question: str, pdf_name: str) -> List[Dict]:
         candidates.append(
             {
                 "parent_id": parent["parent_id"],
+                "pdf_name": pdf_name,
                 "score": comp["score"],
             }
         )
@@ -380,6 +516,7 @@ def add_candidate(candidate_map: Dict[str, Dict], candidate: Dict):
     candidate.setdefault("tree_score", 0.0)
     candidate.setdefault("semantic_score", 0.0)
     candidate.setdefault("rerank_score", 0.0)
+    candidate.setdefault("bm25_score", 0.0)
     candidate["score"] = compute_total_score(candidate)
     candidate["query_hits"] = int(candidate.get("query_hits", 1))
     if not existing:
@@ -392,6 +529,7 @@ def add_candidate(candidate_map: Dict[str, Dict], candidate: Dict):
         float(candidate.get("semantic_score", 0.0)),
     )
     existing["rerank_score"] = max(float(existing.get("rerank_score", 0.0)), float(candidate.get("rerank_score", 0.0)))
+    existing["bm25_score"] = max(float(existing.get("bm25_score", 0.0)), float(candidate.get("bm25_score", 0.0)))
     existing["query_hits"] = int(existing.get("query_hits", 1)) + int(candidate.get("query_hits", 1))
     existing["source"] = ",".join(
         dedupe_preserve_order(
@@ -413,20 +551,24 @@ def _chunk_text_from_tree(tree: Dict, chunk_id: str) -> tuple:
 
 def get_chunks_from_selected_parents(
     question: str,
-    top_pdf_names: List[str],
-    selected_parent_ids: List[str],
+    selected_parent_ids_by_pdf: Dict[str, set],
     query_weight: float = 1.0,
 ) -> Dict[str, Dict]:
     candidate_map = {}
-    selected_parent_id_set = set(selected_parent_ids)
-
-    for pdf_name in top_pdf_names:
+    for pdf_name, allowed_parent_ids in selected_parent_ids_by_pdf.items():
+        if not allowed_parent_ids:
+            continue
         tree = load_tree(pdf_name)
         if not tree:
             continue
 
+        chunk_lookup = {
+            str(c.get("chunk_id", "")): (c.get("text") or "", c.get("page", 0))
+            for c in tree.get("chunks", [])
+        }
+
         for parent in tree.get("parents", []):
-            if parent["parent_id"] not in selected_parent_id_set:
+            if parent["parent_id"] not in allowed_parent_ids:
                 continue
 
             child_ids = [str(cid) for cid in parent.get("child_chunk_ids", [])]
@@ -434,7 +576,7 @@ def get_chunks_from_selected_parents(
                 continue
 
             for cid in child_ids:
-                text, page = _chunk_text_from_tree(tree, cid)
+                text, page = chunk_lookup.get(cid, ("", 0))
                 if not (text and text.strip()):
                     continue
                 tree_component, _ = component_scores(question, text, None, source="tree")
@@ -459,6 +601,7 @@ def get_chunks_from_selected_parents(
 def get_direct_chunk_candidates(
     question: str,
     top_pdf_names: List[str],
+    selected_parent_ids_by_pdf: Dict[str, set],
     query_weight: float = 1.0,
 ) -> Dict[str, Dict]:
     candidate_map = {}
@@ -467,10 +610,15 @@ def get_direct_chunk_candidates(
         return candidate_map
 
     for pdf_name in top_pdf_names:
+        allowed_parent_ids = selected_parent_ids_by_pdf.get(pdf_name, set())
+        if not allowed_parent_ids:
+            continue
         try:
-            results = chunks_collection.query(
-                query_texts=[question],
-                n_results=DIRECT_CHUNK_RETRIEVER_TOP_K,
+            results = _cached_collection_query(
+                chunks_collection,
+                "child_chunks",
+                question,
+                DIRECT_CHUNK_RETRIEVER_TOP_K,
                 where={"pdf_name": pdf_name},
             )
             documents = results.get("documents", [[]])[0]
@@ -479,6 +627,9 @@ def get_direct_chunk_candidates(
 
             for metadata, document, distance in zip(metadatas, documents, distances):
                 if document is None or not (str(document or "").strip()):
+                    continue
+                parent_id = str(metadata.get("parent_id", ""))
+                if parent_id not in allowed_parent_ids:
                     continue
                 chunk_id = str(metadata.get("chunk_id", ""))
                 tree_component, semantic_component = component_scores(
@@ -507,47 +658,55 @@ def get_direct_chunk_candidates(
     return candidate_map
 
 
-def get_global_chunk_candidates(question: str, query_weight: float = 1.0) -> Dict[str, Dict]:
+def get_broader_chunk_candidates(
+    question: str,
+    top_pdf_names: List[str],
+    query_weight: float = 1.0,
+) -> Dict[str, Dict]:
     candidate_map = {}
 
     if not chunks_collection:
         return candidate_map
 
-    try:
-        results = chunks_collection.query(
-            query_texts=[question],
-            n_results=FALLBACK_CONTEXT_CHUNK_COUNT,
-        )
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-
-        for metadata, document, distance in zip(metadatas, documents, distances):
-            if document is None or not (str(document or "").strip()):
-                continue
-            chunk_id = str(metadata.get("chunk_id", ""))
-            tree_component, semantic_component = component_scores(
+    for pdf_name in top_pdf_names:
+        try:
+            results = _cached_collection_query(
+                chunks_collection,
+                "child_chunks",
                 question,
-                document,
-                distance,
-                source="vector_global",
+                FALLBACK_CONTEXT_CHUNK_COUNT,
+                where={"pdf_name": pdf_name},
             )
-            add_candidate(
-                candidate_map,
-                {
-                    "chunk_id": chunk_id,
-                    "pdf_name": metadata.get("pdf_name", ""),
-                    "page": metadata.get("page", 0),
-                    "text": document,
-                    "tree_score": tree_component * query_weight,
-                    "semantic_score": semantic_component * query_weight,
-                    "rerank_score": 0.0,
-                    "source": "vector_global",
-                    "query_hits": 1,
-                },
-            )
-    except Exception as e:
-        print(f"Error running fallback chunk search: {e}")
+            documents = results.get("documents", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            distances = results.get("distances", [[]])[0]
+
+            for metadata, document, distance in zip(metadatas, documents, distances):
+                if document is None or not (str(document or "").strip()):
+                    continue
+                chunk_id = str(metadata.get("chunk_id", ""))
+                tree_component, semantic_component = component_scores(
+                    question,
+                    document,
+                    distance,
+                    source="vector_global",
+                )
+                add_candidate(
+                    candidate_map,
+                    {
+                        "chunk_id": chunk_id,
+                        "pdf_name": metadata.get("pdf_name", pdf_name),
+                        "page": metadata.get("page", 0),
+                        "text": document,
+                        "tree_score": tree_component * query_weight,
+                        "semantic_score": semantic_component * query_weight,
+                        "rerank_score": 0.0,
+                        "source": "vector_global",
+                        "query_hits": 1,
+                    },
+                )
+        except Exception as e:
+            print(f"Error running broader chunk search for {pdf_name}: {e}")
 
     return candidate_map
 
@@ -633,45 +792,63 @@ def build_context(
 ) -> Dict:
     query_variants = query_variants or [question]
 
-    parent_scores: Dict[str, float] = {}
+    parent_scores_by_pdf: Dict[str, Dict[str, float]] = {pdf_name: {} for pdf_name in top_pdf_names}
     for q_idx, query in enumerate(query_variants):
         query_weight = 1.0 / (q_idx + 1)
         for pdf_name in top_pdf_names:
             for candidate in get_parent_candidates(query, pdf_name):
                 pid = candidate["parent_id"]
                 weighted_score = float(candidate["score"]) * query_weight
-                parent_scores[pid] = max(parent_scores.get(pid, 0.0), weighted_score)
+                prev = parent_scores_by_pdf[pdf_name].get(pid, 0.0)
+                parent_scores_by_pdf[pdf_name][pid] = max(prev, weighted_score)
+
+    selected_parent_ids_by_pdf: Dict[str, set] = {}
+    global_parent_scores: List[Tuple[str, str, float]] = []
+    for pdf_name in top_pdf_names:
+        ranked_for_pdf = sorted(
+            parent_scores_by_pdf[pdf_name].items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:PARENTS_PER_DOCUMENT]
+        selected_parent_ids_by_pdf[pdf_name] = {pid for pid, _ in ranked_for_pdf}
+        global_parent_scores.extend((pdf_name, pid, score) for pid, score in ranked_for_pdf)
+
+    if len(global_parent_scores) > MAX_PARENT_CANDIDATES:
+        global_parent_scores.sort(key=lambda item: item[2], reverse=True)
+        allowed_pairs = {(pdf, pid) for pdf, pid, _ in global_parent_scores[:MAX_PARENT_CANDIDATES]}
+        selected_parent_ids_by_pdf = {
+            pdf: {pid for pid in pids if (pdf, pid) in allowed_pairs}
+            for pdf, pids in selected_parent_ids_by_pdf.items()
+        }
 
     selected_parent_ids = [
-        pid
-        for pid, _ in sorted(parent_scores.items(), key=lambda item: item[1], reverse=True)
-    ][:MAX_PARENT_CANDIDATES]
+        f"{pdf_name}:{pid}"
+        for pdf_name, pid_set in selected_parent_ids_by_pdf.items()
+        for pid in pid_set
+    ]
 
     merged_candidates: Dict[str, Dict] = {}
     for q_idx, query in enumerate(query_variants):
         query_weight = 1.0 / (q_idx + 1)
         parent_chunk_candidates = get_chunks_from_selected_parents(
             query,
-            top_pdf_names,
-            selected_parent_ids,
+            selected_parent_ids_by_pdf,
             query_weight=query_weight,
         )
         direct_chunk_candidates = get_direct_chunk_candidates(
             query,
             top_pdf_names,
+            selected_parent_ids_by_pdf,
             query_weight=query_weight,
-        )
-        global_chunk_candidates = get_global_chunk_candidates(
-            query,
-            query_weight=query_weight * 0.8,
         )
 
         for candidate in parent_chunk_candidates.values():
             add_candidate(merged_candidates, candidate)
         for candidate in direct_chunk_candidates.values():
             add_candidate(merged_candidates, candidate)
-        for candidate in global_chunk_candidates.values():
-            add_candidate(merged_candidates, candidate)
+
+        # Hybrid retrieval: score the filtered candidate pool with BM25 keyword ranking.
+        apply_bm25_scores(query, merged_candidates, query_weight=query_weight)
 
     merged_candidates = _apply_route_bias(question, route, merged_candidates)
     candidate_pool_size = (
@@ -839,8 +1016,13 @@ def answer_question(question: str) -> str:
     }
     for q_idx, query in enumerate(query_variants):
         query_weight = 1.0 / (q_idx + 1)
-        for candidate in get_global_chunk_candidates(query, query_weight=query_weight * 0.8).values():
+        for candidate in get_broader_chunk_candidates(
+            query,
+            top_pdf_names,
+            query_weight=query_weight * 0.8,
+        ).values():
             add_candidate(broader_candidates, candidate)
+        apply_bm25_scores(query, broader_candidates, query_weight=query_weight)
 
     broader_ranked = rank_candidates(broader_candidates, FALLBACK_CONTEXT_CHUNK_COUNT)
     broader_reranked = _rerank_candidates(

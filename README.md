@@ -106,6 +106,12 @@ ENABLE_QUERY_ROUTER=true
 ENABLE_RERANKING=true
 ENABLE_MULTI_QUERY_RETRIEVAL=true
 MULTI_QUERY_COUNT=3
+ENABLE_HYBRID_RETRIEVAL=true
+PARENTS_PER_DOCUMENT=4
+BM25_TOP_K=12
+VECTOR_QUERY_CACHE_SIZE=512
+TREE_CACHE_SIZE=64
+TOKEN_CACHE_SIZE=5000
 RERANKER_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-6-v2
 RERANK_CANDIDATE_POOL_SIZE=30
 RERANKED_TOP_K=5
@@ -121,6 +127,14 @@ RETRIEVAL_CACHE_SIZE=256
 Final retrieval scoring is explicitly:
 
 `final_score = TREE_SCORE_WEIGHT * tree_score + SEMANTIC_SCORE_WEIGHT * semantic_score + RERANK_SCORE_WEIGHT * rerank_score`
+
+Pipeline order is now:
+- Root filtering (multi-query)
+- Parent filtering within selected roots
+- Child retrieval only within selected parents (hierarchical filtering)
+- Hybrid fusion: vector + BM25 keyword ranking
+- Cross-encoder reranking
+- Context compression
 
 If `sentence-transformers` or the reranker model cannot load, retrieval still runs with tree + semantic scoring.
 

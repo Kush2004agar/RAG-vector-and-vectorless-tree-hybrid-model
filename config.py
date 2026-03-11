@@ -66,7 +66,13 @@ CHUNK_OVERLAP_CHARS = int(os.environ.get("CHUNK_OVERLAP_CHARS", "120"))
 ENABLE_QUERY_ROUTER = _env_bool("ENABLE_QUERY_ROUTER", True)
 ENABLE_RERANKING = _env_bool("ENABLE_RERANKING", True)
 ENABLE_MULTI_QUERY_RETRIEVAL = _env_bool("ENABLE_MULTI_QUERY_RETRIEVAL", True)
+ENABLE_HYBRID_RETRIEVAL = _env_bool("ENABLE_HYBRID_RETRIEVAL", True)
 MULTI_QUERY_COUNT = int(os.environ.get("MULTI_QUERY_COUNT", "3"))
+PARENTS_PER_DOCUMENT = int(os.environ.get("PARENTS_PER_DOCUMENT", "4"))
+BM25_TOP_K = int(os.environ.get("BM25_TOP_K", "12"))
+VECTOR_QUERY_CACHE_SIZE = int(os.environ.get("VECTOR_QUERY_CACHE_SIZE", "512"))
+TREE_CACHE_SIZE = int(os.environ.get("TREE_CACHE_SIZE", "64"))
+TOKEN_CACHE_SIZE = int(os.environ.get("TOKEN_CACHE_SIZE", "5000"))
 RERANKER_MODEL_NAME = os.environ.get(
     "RERANKER_MODEL_NAME",
     "cross-encoder/ms-marco-MiniLM-L-6-v2",
