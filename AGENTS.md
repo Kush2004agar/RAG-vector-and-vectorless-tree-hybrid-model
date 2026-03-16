@@ -49,17 +49,17 @@ to build context for Google Gemini, which generates answers.
 - `chunk_tree_retriever.py`
   - Core retrieval & answering logic:
     - `load_node_graph(pdf_name)` builds a `Node` graph from a legacy chunk tree.
-    - `multi_stage_retrieve(question)`:
-      1. Retrieves likely PDFs via `root_summaries`.
-      2. Retrieves parent summaries and their child chunks via the node graph and Chroma.
-      3. Merges direct and global chunk candidates.
-      4. Runs a hybrid reranking step (currently a heuristic score, factored out for future weighting).
-      5. Calls `expand_tree_neighbors(...)` to add parent/sibling context around top chunks.
-    - `optimize_chunks_for_context(...)` deduplicates chunks before the final Gemini prompt.
+    - Retrieval orchestration:
+      1. Optionally routes queries to a retrieval strategy (tree/vector/lexical/hybrid).
+      2. Retrieves likely PDFs via `root_summaries`.
+      3. Retrieves parent summaries and their child chunks via the node graph and Chroma.
+      4. Merges direct and global chunk candidates.
+      5. Reranks candidates using heuristics and (optionally) an ML CrossEncoder reranker.
+      6. Filters/compresses/deduplicates context before building the final Gemini prompt.
+    - `optimize_chunks_for_context(...)` deduplicates chunks before the final prompt.
     - `answer_question(question)` orchestrates:
-      - query classification,
-      - multi-stage retrieval,
-      - context optimization,
+      - retrieval (routing + ranking + optional reranking),
+      - context preparation,
       - Gemini call for the final answer.
 
 - `run_qa_pipeline.py`
@@ -86,11 +86,13 @@ to build context for Google Gemini, which generates answers.
   - When adding new signals (e.g. structural scores, keyword scores), plug them into the explicit stages instead of creating new ad-hoc code paths.
 
 - **Reranking guidance**
-  - Today, “reranking” is a **heuristic sort** over candidates (lexical overlap + vector distance).
-  - If you introduce an ML/LLM reranker, keep it as a distinct stage that:
-    - reranks a bounded candidate set (e.g. top 50–200),
-    - is configurable (so it can be turned off for cost/latency),
-    - logs inputs/outputs for evaluation.
+  - Reranking is a distinct stage:
+    - A heuristic rank step always runs (lexical overlap + vector distance).
+    - An optional ML reranker may run when enabled (CrossEncoder via `sentence_transformers`).
+  - Keep any reranker:
+    - bounded (e.g. rerank top 50–200),
+    - configurable (enable/disable, model name),
+    - observable (log candidate pool sizes and whether reranking ran).
 
 - **Be careful with vector DB changes**
   - If you alter collection schemas (e.g. adding `node_id` to metadata), also:

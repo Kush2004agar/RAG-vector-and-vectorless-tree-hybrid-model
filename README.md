@@ -48,23 +48,24 @@ At a high level, the system is a **hybrid hierarchical RAG** pipeline:
   - `legacy_tree_to_nodes(...)` adapts the existing tree JSON files into a `node_id → Node` graph in memory, without changing files on disk.
 
 - **Query understanding & retrieval**
-  - `query_classifier.py` labels each question as: definition, comparison, reasoning, summarization, navigation, or other.
   - `chunk_tree_retriever.py` runs a staged pipeline:
-    1. Retrieve likely PDFs via `root_summaries`.
-    2. Retrieve parent summaries and their child chunks via the node graph and Chroma.
-    3. Merge direct + global chunk candidates.
-    4. **Rerank** candidates (currently a heuristic score).
-    5. Expand tree neighbors around top chunks.
-    6. Deduplicate context before sending it to Gemini.
+    1. **Route** the query to a retrieval strategy (tree/vector/lexical/hybrid) if enabled.
+    2. Retrieve likely PDFs via `root_summaries`.
+    3. Retrieve parent summaries and their child chunks via the node graph and Chroma.
+    4. Merge direct + global chunk candidates.
+    5. **Rerank** candidates (heuristics + optional ML reranker).
+    6. Filter/compress/deduplicate context before sending it to Gemini.
 
 - **Reranking (what it is today)**
-  - No separate ML “reranker model” is used.
-  - Candidates are scored using a combination of:
+  - Base score combines:
     - lexical overlap (`lexical_score`),
     - and Chroma distance (via `combined_score`).
+  - Optional **CrossEncoder reranker**:
+    - If enabled via `config.py` (see `ENABLE_RERANKING`, `RERANKER_MODEL_NAME`), the system will rerank a bounded candidate pool using `sentence_transformers.CrossEncoder`.
   - **How many times reranking runs per query**:
-    - Usually **2×** (initial merge, then after tree-neighbor expansion).
-    - **3×** if the first Gemini attempt returns “not found” (fallback rerank + retry).
+    - At least **1×** (rank candidate pool).
+    - Plus **1×** for CrossEncoder reranking when enabled.
+    - Plus **1×** again on fallback retry if the first Gemini attempt returns “not found”.
 
 ## Common setup issues
 
