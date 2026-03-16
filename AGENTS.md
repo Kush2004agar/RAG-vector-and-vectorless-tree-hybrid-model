@@ -53,7 +53,7 @@ to build context for Google Gemini, which generates answers.
       1. Retrieves likely PDFs via `root_summaries`.
       2. Retrieves parent summaries and their child chunks via the node graph and Chroma.
       3. Merges direct and global chunk candidates.
-      4. Runs a hybrid reranking step (currently the existing lexical+distance score, factored for future weighting).
+      4. Runs a hybrid reranking step (currently a heuristic score, factored out for future weighting).
       5. Calls `expand_tree_neighbors(...)` to add parent/sibling context around top chunks.
     - `optimize_chunks_for_context(...)` deduplicates chunks before the final Gemini prompt.
     - `answer_question(question)` orchestrates:
@@ -84,6 +84,13 @@ to build context for Google Gemini, which generates answers.
     6. Context optimization (`optimize_chunks_for_context`).
     7. Answer generation (`generate_answer`).
   - When adding new signals (e.g. structural scores, keyword scores), plug them into the explicit stages instead of creating new ad-hoc code paths.
+
+- **Reranking guidance**
+  - Today, “reranking” is a **heuristic sort** over candidates (lexical overlap + vector distance).
+  - If you introduce an ML/LLM reranker, keep it as a distinct stage that:
+    - reranks a bounded candidate set (e.g. top 50–200),
+    - is configurable (so it can be turned off for cost/latency),
+    - logs inputs/outputs for evaluation.
 
 - **Be careful with vector DB changes**
   - If you alter collection schemas (e.g. adding `node_id` to metadata), also:
