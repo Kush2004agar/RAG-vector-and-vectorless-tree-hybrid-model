@@ -23,25 +23,68 @@ def classify_query(query: str) -> QueryType:
     if not q:
         return QueryType.OTHER
 
-    # Definition-style questions
-    if re.search(r"\bwhat is\b", q) or "define " in q:
-        return QueryType.DEFINITION
+    definition_patterns = [
+        r"\bwhat is\b",
+        r"\bwhat are\b",
+        r"\bdefine\b",
+        r"\bmeaning of\b",
+        r"\bstands for\b",
+        r"\brefers to\b",
+    ]
+    comparison_patterns = [
+        r"\bdifference between\b",
+        r"\bdiffer from\b",
+        r"\bcompare\b",
+        r"\bversus\b",
+        r"\bvs\.?\b",
+        r"\bbetter than\b",
+        r"\bsimilarities\b",
+    ]
+    summarization_patterns = [
+        r"\bsummarize\b",
+        r"\bsummary of\b",
+        r"\boverview of\b",
+        r"\btl;dr\b",
+        r"\bin short\b",
+        r"\bkey points\b",
+    ]
+    navigation_patterns = [
+        r"^where\b",
+        r"\bwhich section\b",
+        r"\bwhere in\b",
+        r"\blocated\b",
+        r"\bpage\b",
+        r"\bchapter\b",
+        r"\bfind\b",
+    ]
+    reasoning_patterns = [
+        r"^how\b",
+        r"^why\b",
+        r"\bexplain how\b",
+        r"\bexplain why\b",
+        r"\breason\b",
+        r"\bimpact\b",
+        r"\bcause\b",
+    ]
 
-    # Comparison questions
-    if "difference between" in q or " differ from " in q or " vs " in q:
+    # Check comparison first to avoid misclassifying "what is the difference..."
+    if any(re.search(pattern, q) for pattern in comparison_patterns):
         return QueryType.COMPARISON
 
+    # Definition-style questions
+    if any(re.search(pattern, q) for pattern in definition_patterns):
+        return QueryType.DEFINITION
+
     # Summarization requests
-    if "summarize" in q or "summary of" in q or "overview of" in q:
+    if any(re.search(pattern, q) for pattern in summarization_patterns):
         return QueryType.SUMMARIZATION
 
     # Navigation / locating information
-    if q.startswith("where ") or "which section" in q or "located" in q:
+    if any(re.search(pattern, q) for pattern in navigation_patterns):
         return QueryType.NAVIGATION
 
     # Reasoning / how / why
-    if q.startswith("how ") or q.startswith("why ") or "explain how" in q:
+    if any(re.search(pattern, q) for pattern in reasoning_patterns):
         return QueryType.REASONING
 
     return QueryType.OTHER
-

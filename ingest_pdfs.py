@@ -1,5 +1,3 @@
-import os
-import glob
 import json
 import shutil
 import re
@@ -28,6 +26,10 @@ def clear_cache():
     if trees_dir.exists():
         shutil.rmtree(trees_dir)
         trees_dir.mkdir()
+
+    raw_chunks_file = CACHE_DIR / "raw_chunks.json"
+    if raw_chunks_file.exists():
+        raw_chunks_file.unlink()
         
     print("Cache cleared successfully.")
 
