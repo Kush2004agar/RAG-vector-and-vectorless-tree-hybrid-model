@@ -624,6 +624,14 @@ def generate_answer(question: str, context_chunks: List[Dict]) -> str:
     if not context_chunks:
         return NOT_FOUND_MESSAGE
 
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key":
+        fallback_points = []
+        for chunk in context_chunks[:3]:
+            text = " ".join(str(chunk.get("text", "")).split())
+            if text:
+                fallback_points.append(f"- {text[:260].rstrip()}")
+        return "\n".join(fallback_points) if fallback_points else NOT_FOUND_MESSAGE
+
     final_prompt = (
         "Answer the question using ONLY the provided document excerpts. Do not add any preamble or meta phrase.\n"
         f"Question: {question}\n\n"
@@ -677,7 +685,6 @@ def answer_question(question: str) -> str:
     print(f"Selected parent IDs: {selected_parent_ids}")
     print(f"Candidate pool size before rerank: {len(candidate_pool)}")
 
-    print("Phase 3: Context filtering and compression...")
     print("Phase 3: Context filtering and compression...")
     usable = [c for c in ranked_chunks if c.get("text") and str(c["text"]).strip()]
     print(f"Using {len(usable)} chunks for the first answer attempt.")

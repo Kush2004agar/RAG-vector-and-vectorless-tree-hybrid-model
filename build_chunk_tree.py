@@ -1,8 +1,6 @@
-import os
 import json
 from google import genai
 from typing import List, Dict
-from pathlib import Path
 from config import GEMINI_API_KEY, CHUNK_GROUP_SIZE, CACHE_DIR, TREES_DIR
 
 # Setup Gemini client

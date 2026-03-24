@@ -1,6 +1,5 @@
 import chromadb
 import json
-from pathlib import Path
 from config import VECTOR_DB_DIR, TREES_DIR
 
 
