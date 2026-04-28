@@ -74,16 +74,11 @@ class TestSyncDriveFiles:
         file_response = MagicMock()
         file_response.content = b"%PDF-test-content"
 
-        call_count = {"n": 0}
-
-        def _get(url, **kwargs):
-            call_count["n"] += 1
-            if "graph.microsoft.com" in url:
-                return list_response
-            return file_response
+        # First call is the Graph API listing; second call is the file download.
+        responses = iter([list_response, file_response])
 
         with patch.object(fetch_drive, "get_access_token", return_value="tok"), \
-             patch.object(fetch_drive.requests, "get", side_effect=_get), \
+             patch.object(fetch_drive.requests, "get", side_effect=lambda *a, **kw: next(responses)), \
              patch.object(fetch_drive, "INPUT_DIR", tmp_path):
             fetch_drive.sync_drive_files()
 
