@@ -96,6 +96,7 @@ QDRANT_API_KEY=... # optional
    python run_qa_pipeline.py
    ```
 
+
 ## Evaluation
 
 Use `rag_v3/evaluation` modules to compute retrieval quality (Recall@K and MRR) from JSON datasets with `query` and `relevant_chunk_ids`.
