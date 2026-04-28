@@ -1,6 +1,6 @@
 # RAG V3 (Single Qdrant Pipeline)
 
-This repository now implements a clean V3 Retrieval-Augmented Generation (RAG) architecture with **Qdrant as the only retrieval backend**.
+This repository implements a clean V3 Retrieval-Augmented Generation (RAG) architecture with **Qdrant as the only retrieval backend**.
 
 ## V3 retrieval flow
 
@@ -30,6 +30,10 @@ rag_v3/
     context_builder.py
   serving/
     pipeline.py
+  evaluation/
+    dataset.py
+    metrics.py
+    evaluator.py
 ```
 
 ## Data models
@@ -52,6 +56,25 @@ GEMINI_API_KEY=...
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=... # optional
 ```
+
+## Run Qdrant locally with Docker
+
+1. Start Qdrant:
+   ```bash
+   ./scripts/qdrant_local.sh up
+   ```
+2. Verify status:
+   ```bash
+   ./scripts/qdrant_local.sh status
+   ```
+3. Follow logs (optional):
+   ```bash
+   ./scripts/qdrant_local.sh logs
+   ```
+4. Stop when done:
+   ```bash
+   ./scripts/qdrant_local.sh down
+   ```
 
 ## Usage
 
