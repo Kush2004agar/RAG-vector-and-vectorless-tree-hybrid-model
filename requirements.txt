@@ -1,5 +1,6 @@
 google-genai
-chromadb
+qdrant-client
+sentence-transformers
 pdfplumber
 pandas
 openpyxl

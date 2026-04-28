@@ -1,86 +1,79 @@
-# Chunk-Tree RAG Pipeline
+# RAG V3 (Single Qdrant Pipeline)
 
-This repo contains a Python Retrieval-Augmented Generation (RAG) pipeline built around a hierarchical **chunk-tree** representation of PDFs. All summarization and question-answering is done by **Google Gemini** (Gemini); ChromaDB is used as the vector store.
+This repository now implements a clean V3 Retrieval-Augmented Generation (RAG) architecture with **Qdrant as the only retrieval backend**.
 
-The repo is set up so that a new user starts with **code only**: no cached trees, vector DB, or local data are tracked in git.
+## V3 retrieval flow
 
-## Prerequisites
+`query -> process -> filter -> Qdrant search -> rerank -> context -> LLM`
 
-- Python 3.10+
-- A virtual environment (recommended)
-- Google Gemini API key
-- (Optional) Microsoft Graph / OneDrive app registration if you want to sync PDFs from the cloud
+There is exactly one retriever path, one vector search call per query, and no route-switching or graph expansion.
+
+## Project structure
+
+```text
+rag_v3/
+  ingestion/
+    chunker.py
+    feature_extractor.py
+  indexing/
+    embedder.py
+    qdrant_client.py
+    index_builder.py
+  retrieval/
+    query_processor.py
+    filter_builder.py
+    retriever.py
+    schemas.py
+  ranking/
+    reranker.py
+  context/
+    context_builder.py
+  serving/
+    pipeline.py
+```
+
+## Data models
+
+- `Query`: `raw`, `cleaned`, `tokens`, `feature_ids`
+- `Candidate`: `id`, `text`, `score`, `metadata`
 
 ## Setup
 
 ```bash
-git clone <this-repo>
-cd rag+page\ index  # or your chosen folder name
-
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root:
+Create `.env` with at least:
 
 ```bash
-GEMINI_API_KEY=your_gemini_api_key
-MS_CLIENT_ID=your_client_id          # optional, for OneDrive sync
-MS_CLIENT_SECRET=your_client_secret  # optional
-MS_TENANT_ID=your_tenant_id          # optional
-MS_DRIVE_ID=your_drive_id            # optional
-MS_FOLDER_ID=your_folder_id          # optional
+GEMINI_API_KEY=...
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=... # optional
 ```
 
-## Typical workflow (fresh clone)
+## Usage
 
-1. **(Optional) Sync PDFs and Excel files from OneDrive**
-
-   ```bash
-   python fetch_drive.py
-   ```
-
-   Or manually drop your `.pdf` and `.xlsx` files into `data/input/`.
-
-2. **Ingest PDFs into raw chunks**
-
+1. Put PDFs into `data/input/`.
+2. Extract chunks:
    ```bash
    python ingest_pdfs.py
    ```
-
-3. **Build chunk trees (root, parents, children)**
-
-   ```bash
-   python build_chunk_tree.py
-   ```
-
-4. **Initialize and populate the vector DB**
-
+3. Build Qdrant `documents` collection:
    ```bash
    python setup_vector_db.py
    ```
-
-5. **Ask a single question**
-
+4. Ask one question:
    ```bash
-   python chunk_tree_retriever.py "Your question here"
+   python -c "from rag_v3.serving.pipeline import RagV3Pipeline; print(RagV3Pipeline().answer('your question'))"
    ```
-
-6. **Run the batch QA pipeline from an Excel file**
-
+5. Or batch from Excel:
    ```bash
    python run_qa_pipeline.py
    ```
 
-## Resetting local state (start fresh locally)
 
-To wipe local caches and the vector DB (without touching git-tracked code):
+## Evaluation
 
-```bash
-python ingest_pdfs.py --clear-cache
-```
-
-Then re-run the pipeline steps above.
-
+Use `rag_v3/evaluation` modules to compute retrieval quality (Recall@K and MRR) from JSON datasets with `query` and `relevant_chunk_ids`.

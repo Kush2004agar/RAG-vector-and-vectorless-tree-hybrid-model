@@ -2,7 +2,9 @@ import glob
 import pandas as pd
 from pathlib import Path
 from config import INPUT_DIR
-from chunk_tree_retriever import answer_question
+from rag_v3.serving.pipeline import RagV3Pipeline
+
+pipeline = RagV3Pipeline()
 
 def run_pipeline():
     # Find any Excel sheet in the input directory dynamically via glob
@@ -40,7 +42,7 @@ def run_pipeline():
              answers.append("N/A")
              continue
              
-        ans = answer_question(q)
+        ans = pipeline.answer(q)
         answers.append(ans)
         
     # Save results
