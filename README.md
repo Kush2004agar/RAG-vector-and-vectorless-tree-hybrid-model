@@ -66,9 +66,14 @@ QDRANT_API_KEY=... # optional
    ```
 4. Ask one question:
    ```bash
-   python chunk_tree_retriever.py "your question"
+   python -c "from rag_v3.serving.pipeline import RagV3Pipeline; print(RagV3Pipeline().answer('your question'))"
    ```
 5. Or batch from Excel:
    ```bash
    python run_qa_pipeline.py
    ```
+
+
+## Evaluation
+
+Use `rag_v3/evaluation` modules to compute retrieval quality (Recall@K and MRR) from JSON datasets with `query` and `relevant_chunk_ids`.

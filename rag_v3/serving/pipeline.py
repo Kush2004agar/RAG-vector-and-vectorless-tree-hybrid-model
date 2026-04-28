@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from google import genai
@@ -12,8 +13,10 @@ from rag_v3.ranking.reranker import Reranker
 from rag_v3.retrieval.filter_builder import FilterBuilder
 from rag_v3.retrieval.query_processor import QueryProcessor
 from rag_v3.retrieval.retriever import Retriever
+from rag_v3.retrieval.schemas import Candidate, Query
 
 NOT_FOUND_MESSAGE = "Information not found in available documents."
+logger = logging.getLogger(__name__)
 
 
 class RagV3Pipeline:
@@ -23,14 +26,42 @@ class RagV3Pipeline:
         feature_extractor = FeatureExtractor()
         embedder = Embedder()
         store = QdrantStore(vector_size=embedder.dim)
+        self.filter_builder = FilterBuilder()
 
         self.query_processor = QueryProcessor(feature_extractor)
-        self.retriever = Retriever(store=store, embedder=embedder, filter_builder=FilterBuilder())
+        self.retriever = Retriever(store=store, embedder=embedder, filter_builder=self.filter_builder)
         self.reranker = Reranker()
         self.context_builder = ContextBuilder(min_chunks=5, max_chunks=8)
 
         api_key = os.environ.get("GEMINI_API_KEY")
         self.llm = genai.Client(api_key=api_key) if api_key else None
+
+    def _log_retrieval(self, query: Query, candidates: list[Candidate]) -> None:
+        q_filter = self.filter_builder.build(query)
+        top10 = [
+            {
+                "id": candidate.id,
+                "vector_score": candidate.score,
+                "lexical_score": candidate.metadata.get("lexical_score", 0.0),
+            }
+            for candidate in candidates[:10]
+        ]
+        logger.info(
+            "retrieval_event",
+            extra={
+                "query": query.cleaned,
+                "features": query.feature_ids,
+                "filter": str(q_filter) if q_filter else None,
+                "top10": top10,
+            },
+        )
+
+    def retrieve_only(self, question: str, top_k: int = 50) -> list[Candidate]:
+        query = self.query_processor.process(question)
+        candidates = self.retriever.retrieve(query, limit=top_k)
+        reranked = self.reranker.rerank(query, candidates)
+        self._log_retrieval(query, reranked)
+        return reranked
 
     def generate_answer(self, question: str, context: str) -> str:
         if not context:
@@ -56,5 +87,6 @@ class RagV3Pipeline:
         query = self.query_processor.process(question)
         candidates = self.retriever.retrieve(query, limit=50)
         reranked = self.reranker.rerank(query, candidates)
+        self._log_retrieval(query, reranked)
         context = self.context_builder.build(reranked)
         return self.generate_answer(question=query.cleaned, context=context)

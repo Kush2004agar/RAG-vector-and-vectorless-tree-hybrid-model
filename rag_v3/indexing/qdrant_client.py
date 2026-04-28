@@ -3,14 +3,20 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models
+except ImportError:  # pragma: no cover - environment dependent
+    QdrantClient = None
+    models = None
 
 
 class QdrantStore:
     COLLECTION_NAME = "documents"
 
     def __init__(self, vector_size: int) -> None:
+        if QdrantClient is None or models is None:
+            raise RuntimeError("qdrant-client is not installed. Run `pip install -r requirements.txt`.")
         url = os.environ.get("QDRANT_URL", "http://localhost:6333")
         api_key = os.environ.get("QDRANT_API_KEY")
         self.client = QdrantClient(url=url, api_key=api_key)

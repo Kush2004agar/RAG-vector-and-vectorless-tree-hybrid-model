@@ -16,24 +16,20 @@ class IndexBuilder:
 
     def rebuild(self, chunks: list[Chunk]) -> None:
         self.store.ensure_collection()
+        if not chunks:
+            return
 
-        ids: list[str] = []
-        vectors: list[list[float]] = []
-        texts: list[str] = []
-        payloads: list[dict[str, object]] = []
+        ids = [chunk.id for chunk in chunks]
+        texts = [chunk.text for chunk in chunks]
+        vectors = self.embedder.embed_batch(texts)
+        payloads = [
+            {
+                "feature_ids": self.feature_extractor.extract(chunk.text),
+                "pdf_name": chunk.pdf_name,
+                "section": chunk.section,
+                "version": chunk.version,
+            }
+            for chunk in chunks
+        ]
 
-        for chunk in chunks:
-            ids.append(chunk.id)
-            texts.append(chunk.text)
-            vectors.append(self.embedder.embed(chunk.text))
-            payloads.append(
-                {
-                    "feature_ids": self.feature_extractor.extract(chunk.text),
-                    "pdf_name": chunk.pdf_name,
-                    "section": chunk.section,
-                    "version": chunk.version,
-                }
-            )
-
-        if ids:
-            self.store.upsert(ids=ids, vectors=vectors, texts=texts, payloads=payloads)
+        self.store.upsert(ids=ids, vectors=vectors, texts=texts, payloads=payloads)
