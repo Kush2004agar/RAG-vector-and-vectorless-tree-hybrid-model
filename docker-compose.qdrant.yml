@@ -1,0 +1,14 @@
+version: '3.9'
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    container_name: rag-v3-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
